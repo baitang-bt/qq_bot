@@ -1,0 +1,30 @@
+# 回复开关与频率。保存后下次消息就会重读，不必重启进程。
+# 开发时先把间隔调大，确认不吵再放宽。
+
+enabled = true
+
+# 场景
+c2c = true
+group = true
+
+# 内容类型（语音走事件里的 asr_refer_text，没有官方单独 ASR HTTP）
+on_text = true
+on_image = true
+on_voice = true
+
+# 同一会话：两次回复至少隔这么多秒；一分钟最多几条
+min_interval_seconds = 12
+max_per_session_per_minute = 3
+
+# 非空则用户文本（含语音转写）必须包含其中之一才回
+require_keywords = []
+
+# 包含这些词就不回
+skip_keywords = []
+
+# 未@的群消息。开放平台必须开启「接收所有消息」，才会推 GROUP_MESSAGE_CREATE。
+group_unmentioned = true
+unmentioned_cooldown_seconds = 5
+# true：没@时只在提问/点名时才回，避免每句都打模型
+unmentioned_need_hook = true
+bot_names = ["0x01"]

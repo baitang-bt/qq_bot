@@ -1,0 +1,67 @@
+"""Owner slash commands. Commands are answered as plain text, not via the chat model."""
+
+from __future__ import annotations
+
+import logging
+import re
+
+from app.impression.store import ImpressionStore
+from app.owner import OwnerGate
+from app.qq.events import IncomingMessage
+
+_log = logging.getLogger(__name__)
+_AT_PREFIX = re.compile(r"^(?:<@!?\w+>\s*)+")
+_IMPRESSION = re.compile(
+    r"^/(?:impression|impression)(?:\s+|　+)(.+)$",
+    re.IGNORECASE,
+)
+_BIND = re.compile(r"^/bind(?:\s+|　+)(.*)$", re.IGNORECASE)
+_DENIED = (
+    "这条指令只认 .env 里的 QQ_ID，不是群主身份。"
+    "官方群消息里没有 QQ 号，请先私聊发送：/bind 你的QQ号"
+)
+
+
+class CommandRouter:
+    """Parse and run slash commands for the bot owner."""
+
+    def __init__(self, owner: OwnerGate, impressions: ImpressionStore) -> None:
+        self._owner = owner
+        self._impressions = impressions
+
+    def try_handle(self, message: IncomingMessage) -> str | None:
+        """Return a command reply, or None if this is not a directed slash command."""
+        if message.is_group and not message.mentioned:
+            return None
+        text = _slash_text(message)
+        if not text.startswith("/"):
+            return None
+        bind = _BIND.match(text)
+        if bind:
+            return self._owner.bind_claimed_qq(message, bind.group(1).strip())
+        if not self._owner.allows(message, self._impressions):
+            return _DENIED
+        match = _IMPRESSION.match(text)
+        if match:
+            return self._impression(match.group(1).strip())
+        return "还不认识这条指令。现在可以用：/bind QQ号，/impression 昵称"
+
+    def _impression(self, username: str) -> str:
+        """Dump the stored impression prompt for a username."""
+        if not username:
+            return "用法：/impression 昵称"
+        hits = self._impressions.find_by_username(username)
+        if not hits:
+            return f"没有找到昵称「{username}」的印象。对方至少要跟 bot 说过话才会建档。"
+        lines: list[str] = []
+        for record in hits:
+            body = str(record.get("impression") or "").strip() or "（还没有印象正文）"
+            qq = str(record.get("qq") or "").strip()
+            extra = f"，qq={qq}" if qq else ""
+            lines.append(f"{record.get('username') or username}{extra} 的印象：\n{body}")
+        return "\n\n".join(lines)
+
+
+def _slash_text(message: IncomingMessage) -> str:
+    """Strip leading @ tags so @bot /impression still counts as a command."""
+    return _AT_PREFIX.sub("", message.user_text.strip()).strip()

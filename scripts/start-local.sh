@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# 本机启动 bot。默认走 WebSocket 出站网关，不必开 ngrok。
+# 电脑关机或跑 stop-local.sh 即停止。需要 Webhook 时再 START_NGROK=1。
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+NGROK="${NGROK:-ngrok}"
+PID_DIR="$ROOT/data"
+UV_PID="$PID_DIR/uvicorn.pid"
+NG_PID="$PID_DIR/ngrok.pid"
+mkdir -p "$PID_DIR"
+
+# .env 只给当前用户读，避免其它账号扫到密钥。
+if [[ -f "$ROOT/.env" ]]; then
+  chmod 600 "$ROOT/.env"
+fi
+
+if [[ ! -x "$ROOT/.venv/bin/uvicorn" ]]; then
+  echo "缺少 .venv，先在项目目录执行: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+  exit 1
+fi
+
+if [[ -f "$UV_PID" ]] && kill -0 "$(cat "$UV_PID")" 2>/dev/null; then
+  echo "uvicorn 已在运行 pid=$(cat "$UV_PID")"
+else
+  cd "$ROOT"
+  nohup "$ROOT/.venv/bin/uvicorn" app.main:app --host 127.0.0.1 --port 8080 \
+    >"$PID_DIR/uvicorn.log" 2>&1 &
+  echo $! >"$UV_PID"
+  echo "uvicorn 已启动 pid=$(cat "$UV_PID")"
+fi
+
+if [[ "${START_NGROK:-}" == "1" ]]; then
+  if [[ ! -x "$NGROK" ]]; then
+    echo "找不到 ngrok: $NGROK"
+    exit 1
+  fi
+  if [[ -f "$NG_PID" ]] && kill -0 "$(cat "$NG_PID")" 2>/dev/null; then
+    echo "ngrok 已在运行 pid=$(cat "$NG_PID")"
+  else
+    nohup "$NGROK" http 127.0.0.1:8080 --inspect=false --log=stdout \
+      >"$PID_DIR/ngrok.log" 2>&1 &
+    echo $! >"$NG_PID"
+    echo "ngrok 已启动 pid=$(cat "$NG_PID")"
+  fi
+fi
+
+for _ in $(seq 1 20); do
+  if curl -sf http://127.0.0.1:8080/health >/dev/null; then
+    break
+  fi
+  sleep 0.3
+done
+
+URL=""
+for port in 4040 4041 4042; do
+  URL="$(curl -sf "http://127.0.0.1:${port}/api/tunnels" 2>/dev/null \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(next((t['public_url'] for t in d.get('tunnels',[]) if t.get('public_url','').startswith('https://')), ''))" 2>/dev/null || true)"
+  if [[ -n "$URL" ]]; then
+    break
+  fi
+  sleep 0.3
+done
+
+echo "本机: http://127.0.0.1:8080/health"
+echo "接入方式请保持 WebSocket。本进程在跑时后台应变为在线。"
+if [[ "${START_NGROK:-}" == "1" ]]; then
+  if [[ -n "$URL" ]]; then
+    echo "开放平台回调: ${URL}/qq/webhook"
+    echo "每次重新开隧道，这个地址可能变，需要再填一次。"
+  else
+    echo "还没读到 ngrok 公网地址，稍后再看 $PID_DIR/ngrok.log"
+  fi
+fi
