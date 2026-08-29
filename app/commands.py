@@ -17,7 +17,7 @@ _IMPRESSION = re.compile(
 )
 _BIND = re.compile(r"^/bind(?:\s+|　+)(.*)$", re.IGNORECASE)
 _DENIED = (
-    "这条指令只认 .env 里的 QQ_ID，不是群主身份。"
+    "这条指令只认管理员 QQ。"
     "官方群消息里没有 QQ 号，请先私聊发送：/bind 你的QQ号"
 )
 
@@ -62,6 +62,18 @@ class CommandRouter:
         return "\n\n".join(lines)
 
 
+def looks_like_command(message: IncomingMessage) -> bool:
+    """True when the inbound line is a directed owner slash command."""
+    if message.is_group and not message.mentioned:
+        return False
+    return _slash_text(message).startswith("/")
+
+
 def _slash_text(message: IncomingMessage) -> str:
     """Strip leading @ tags so @bot /impression still counts as a command."""
-    return _AT_PREFIX.sub("", message.user_text.strip()).strip()
+    typed = message.content.strip()
+    asr = message.asr_text
+    body = typed or asr
+    if typed and asr:
+        body = f"{typed}\n{asr}"
+    return _AT_PREFIX.sub("", body.strip()).strip()

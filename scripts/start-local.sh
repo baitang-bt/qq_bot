@@ -24,7 +24,7 @@ if [[ -f "$UV_PID" ]] && kill -0 "$(cat "$UV_PID")" 2>/dev/null; then
 else
   cd "$ROOT"
   nohup "$ROOT/.venv/bin/uvicorn" app.main:app --host 127.0.0.1 --port 8080 \
-    >"$PID_DIR/uvicorn.log" 2>&1 &
+    --no-access-log >"$PID_DIR/uvicorn.log" 2>&1 &
   echo $! >"$UV_PID"
   echo "uvicorn 已启动 pid=$(cat "$UV_PID")"
 fi

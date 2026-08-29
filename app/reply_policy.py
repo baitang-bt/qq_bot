@@ -6,11 +6,14 @@ import logging
 import time
 import tomllib
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from app.qq.events import IncomingMessage
 
 _log = logging.getLogger(__name__)
+_BEIJING = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,8 @@ class ReplySettings:
     unmentioned_cooldown_seconds: float = 5.0
     unmentioned_need_hook: bool = True
     bot_names: tuple[str, ...] = ()
+    unmentioned_thread_minutes: float = 30.0
+    unmentioned_off_peak_only: bool = True
 
 
 def default_settings() -> ReplySettings:
@@ -70,6 +75,12 @@ def load_reply_settings(path: Path) -> ReplySettings:
             data.get("unmentioned_need_hook", base.unmentioned_need_hook)
         ),
         bot_names=_string_tuple(data.get("bot_names")),
+        unmentioned_thread_minutes=float(
+            data.get("unmentioned_thread_minutes", base.unmentioned_thread_minutes)
+        ),
+        unmentioned_off_peak_only=bool(
+            data.get("unmentioned_off_peak_only", base.unmentioned_off_peak_only)
+        ),
     )
 
 
@@ -89,6 +100,39 @@ class ReplyGate:
         self._settings = default_settings()
         self._hits: dict[str, list[float]] = {}
         self._unat_at: dict[str, float] = {}
+        self._last_bot_reply: dict[str, float] = {}
+
+    def note_bot_reply(self, session_id: str, now: float | None = None) -> None:
+        """Remember that the bot replied in this session (for un-@ thread follow-ups)."""
+        self._touch_thread(session_id, now)
+
+    def note_unmentioned_reply(self, group_id: str, now: float | None = None) -> None:
+        """Record a delivered un-@ group reply for cooldown and per-minute caps."""
+        stamp = time.time() if now is None else now
+        gid = group_id.strip()
+        if not gid:
+            return
+        self._unat_at[gid] = stamp
+        self._record_hit(f"unat:{gid}", stamp)
+
+    def note_user_engagement(self, session_id: str, now: float | None = None) -> None:
+        """Remember @ or name-call so un-@ follow-ups work before the bot finishes replying."""
+        self._touch_thread(session_id, now)
+
+    def note_inbound_engagement(self, message: IncomingMessage, now: float | None = None) -> None:
+        """Open the un-@ thread window when the user @'s or names the bot."""
+        if not message.is_group:
+            return
+        policy = self.current()
+        text = message.user_text.strip()
+        if message.mentioned or message.quotes_bot or _mentions_bot_name(text, policy.bot_names):
+            self.note_user_engagement(message.session_id, now)
+
+    def _touch_thread(self, session_id: str, now: float | None) -> None:
+        """Refresh the active conversation window for a user-in-group session."""
+        stamp = time.time() if now is None else now
+        if session_id.strip():
+            self._last_bot_reply[session_id] = stamp
 
     def current(self) -> ReplySettings:
         """Return the latest policy, reloading from disk when needed."""
@@ -123,25 +167,26 @@ class ReplyGate:
         if policy.skip_keywords and _contains_any(user_text, policy.skip_keywords):
             return "skip_keywords"
         stamp = time.time() if now is None else now
+        if message.mentioned or (message.is_group and message.quotes_bot):
+            reason = self._rate_limit(message.session_id, policy, stamp)
+            if reason:
+                return reason
+            self._record_hit(message.session_id, stamp)
+            return None
         if not message.mentioned:
-            reason = _unmentioned_skip(message, policy)
+            if policy.unmentioned_off_peak_only and is_beijing_unmentioned_peak(stamp):
+                return "unmentioned_peak_hours"
+            reason = _unmentioned_skip(message, policy, self, stamp)
             if reason:
                 return reason
             group_id = message.group_openid or ""
             last = self._unat_at.get(group_id, 0.0)
-            if stamp - last < policy.unmentioned_cooldown_seconds:
+            if last > 0 and stamp - last < policy.unmentioned_cooldown_seconds:
                 return "unmentioned_cooldown"
             cap = self._minute_cap(f"unat:{group_id}", policy, stamp)
             if cap:
                 return cap
-            self._unat_at[group_id] = stamp
-            self._record_hit(f"unat:{group_id}", stamp)
             return None
-        reason = self._rate_limit(message.session_id, policy, stamp)
-        if reason:
-            return reason
-        self._record_hit(message.session_id, stamp)
-        return None
 
     def _reload_if_changed(self) -> None:
         """Reload toml when it appears or its mtime changes."""
@@ -189,26 +234,39 @@ def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
     return any(key.lower() in lowered for key in keywords)
 
 
-_UNAT_HOOKS = (
-    "?",
-    "？",
-    "吗",
-    "么",
-    "呢",
-    "怎么",
-    "为什么",
-    "为啥",
-    "啥",
-    "帮我",
-    "请问",
-    "有人",
-    "谁",
-    "求",
-)
+def _mentions_bot_name(text: str, names: tuple[str, ...]) -> bool:
+    """True when user text contains a configured bot name."""
+    lowered = text.lower()
+    return any(name.lower() in lowered for name in names if name.strip())
 
 
-def _unmentioned_skip(message: IncomingMessage, policy: ReplySettings) -> str | None:
-    """Skip un-@ group lines that are not worth an LLM call."""
+def _has_recent_thread(gate: ReplyGate, session_id: str, now: float, ttl_seconds: float) -> bool:
+    """True when the bot replied in this session within the thread window."""
+    last = gate._last_bot_reply.get(session_id, 0.0)
+    return last > 0 and now - last <= ttl_seconds
+
+
+def _looks_like_group_broadcast(text: str) -> bool:
+    """True when the line is clearly addressed to the whole group, not the bot."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if any(word in stripped for word in ("大家", "各位", "全员", "@all", "@所有人")):
+        return True
+    lowered = stripped.casefold()
+    for phrase in ("我先下班", "我走了", "我先撤", "大家晚安", "各位注意"):
+        if phrase.casefold() in lowered:
+            return True
+    return False
+
+
+def _unmentioned_skip(
+    message: IncomingMessage,
+    policy: ReplySettings,
+    gate: ReplyGate,
+    now: float,
+) -> str | None:
+    """Skip un-@ group lines unless bot is named or the user is in an active thread."""
     if not policy.group_unmentioned:
         return "unmentioned_off"
     if not policy.unmentioned_need_hook:
@@ -216,9 +274,22 @@ def _unmentioned_skip(message: IncomingMessage, policy: ReplySettings) -> str | 
     text = message.user_text.strip()
     if not text:
         return "unmentioned_no_hook"
-    lowered = text.lower()
-    if any(name.lower() in lowered for name in policy.bot_names if name.strip()):
+    if _mentions_bot_name(text, policy.bot_names):
         return None
-    if any(hook in text for hook in _UNAT_HOOKS):
+    ttl = max(1.0, policy.unmentioned_thread_minutes) * 60.0
+    if _has_recent_thread(gate, message.session_id, now, ttl):
+        if _looks_like_group_broadcast(text):
+            return "unmentioned_no_hook"
         return None
     return "unmentioned_no_hook"
+
+
+def is_beijing_unmentioned_peak(stamp: float) -> bool:
+    """True on Mon-Fri 09:00-12:00 and 14:00-18:00 Beijing time (no un-@ replies)."""
+    dt = datetime.fromtimestamp(stamp, tz=_BEIJING)
+    if dt.weekday() >= 5:
+        return False
+    minute_of_day = dt.hour * 60 + dt.minute
+    morning = 9 * 60 <= minute_of_day < 12 * 60
+    afternoon = 14 * 60 <= minute_of_day < 18 * 60
+    return morning or afternoon

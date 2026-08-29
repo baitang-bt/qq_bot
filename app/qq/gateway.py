@@ -14,6 +14,7 @@ from app.bot import ChatBot
 from app.config import Settings
 from app.qq.dedupe import MessageDedupe
 from app.qq.events import parse_incoming
+from app.qq.gateway_stats import MONITOR
 from app.qq.token import TokenManager
 
 _log = logging.getLogger(__name__)
@@ -77,6 +78,7 @@ class QQGateway:
             interval_ms = int((hello.get("d") or {}).get("heartbeat_interval") or 45000)
             await self._identify(ws)
             hb = asyncio.create_task(self._heartbeat(ws, interval_ms / 1000))
+            idle_watch = asyncio.create_task(self._idle_watch())
             try:
                 async for raw in ws:
                     if self._stop.is_set():
@@ -85,7 +87,21 @@ class QQGateway:
                 _log.warning("gateway socket closed by peer")
             finally:
                 hb.cancel()
+                idle_watch.cancel()
                 _log.info("gateway session finished")
+
+    async def _idle_watch(self) -> None:
+        """Log a reminder when no chat events arrive after the gateway is ready."""
+        await asyncio.sleep(90)
+        while not self._stop.is_set():
+            snap = MONITOR.snapshot()
+            if snap["chat_total"] == 0 and snap.get("idle_seconds"):
+                _log.warning(
+                    "gateway 已连接 %ss，仍未收到任何群/私聊消息；"
+                    "未@需在手机 QQ 群机器人设置里开「获取群内全部消息」",
+                    snap["idle_seconds"],
+                )
+            await asyncio.sleep(90)
 
     async def _gateway_url(self) -> str:
         """GET /gateway and return the websocket URL."""
@@ -150,7 +166,9 @@ class QQGateway:
         if isinstance(seq, int):
             self._seq = seq
         op = payload.get("op")
-        _log.info("gateway packet op=%s t=%s", op, payload.get("t"))
+        event_name = payload.get("t")
+        if op != OP_HEARTBEAT_ACK:
+            _log.info("gateway packet op=%s t=%s", op, event_name)
         if op == OP_DISPATCH:
             await self._dispatch(payload)
         elif op == OP_RECONNECT:
@@ -166,33 +184,58 @@ class QQGateway:
 
     async def _dispatch(self, payload: dict[str, Any]) -> None:
         """Turn a Dispatch event into a ChatBot.handle call."""
-        event = str(payload.get("t") or "")
+        event = str(payload.get("t") or "").upper()
         data = payload.get("d") if isinstance(payload.get("d"), dict) else {}
         if event == "READY":
             self._session_id = str(data.get("session_id") or "")
+            MONITOR.mark_ready(self._session_id)
             _log.info("gateway ready session=%s", self._session_id[:8])
+            _log.info(
+                "gateway 已上线，等待 QQ 推送；群里 @ 或发消息后应出现 gateway chat 日志"
+            )
+            _log.info(
+                "未@群消息：手机 QQ 群内点机器人头像 → 设置 →「获取群内全部消息」（WebSocket 无需改开放平台）"
+            )
             return
         if event == "RESUMED":
             _log.info("gateway resumed")
+            MONITOR.note_event("RESUMED")
             return
+        if event == "GROUP_MSG_RECEIVE":
+            group = str(data.get("group_openid") or "")
+            MONITOR.note_full_message_enabled()
+            MONITOR.note_event(event)
+            _log.info("group full-message enabled group=%s", group[:8] if group else "-")
+            return
+        if event == "GROUP_MSG_REJECT":
+            group = str(data.get("group_openid") or "")
+            MONITOR.note_event(event)
+            _log.warning("group full-message disabled group=%s", group[:8] if group else "-")
+            return
+        MONITOR.note_event(event)
+        payload = {**payload, "t": event}
         message = parse_incoming(payload)
         if message is None:
+            MONITOR.note_ignored()
             _log.info("gateway ignore t=%s", event or "-")
             return
         if self._dedupe.already_handled(message.msg_id):
             _log.info("gateway duplicate msg_id=%s", message.msg_id)
             return
+        preview = message.user_text.replace("\n", " ")[:60]
+        MONITOR.note_chat(event, preview, message.mentioned)
         _log.info(
-            "gateway chat t=%s msg_id=%s group=%s",
+            "gateway chat t=%s mentioned=%s user=%s preview=%r",
             event,
-            message.msg_id,
-            bool(message.group_openid),
+            message.mentioned,
+            message.username or message.user_openid[:8],
+            preview,
         )
         asyncio.create_task(self._run_bot(message))
 
     async def _run_bot(self, message: Any) -> None:
         """Run the bot without blocking the gateway receive loop."""
         try:
-            await self._bot.handle(message)
-        except Exception:
+            await self._bot.enqueue(message)
+        except BaseException:
             _log.exception("bot handle failed msg_id=%s", getattr(message, "msg_id", ""))

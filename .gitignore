@@ -16,5 +16,6 @@ data/*.pid
 data/*.log
 data/impressions/*.json
 data/owner.json
+data/command_admins.json
 .DS_Store
 *.log

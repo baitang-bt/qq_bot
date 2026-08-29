@@ -54,13 +54,12 @@ def test_impression_after_bind(tmp_path: Path) -> None:
 
 
 def test_group_owner_role_is_not_enough(tmp_path: Path) -> None:
-    """Being 群主 does not authorize commands; QQ_ID bind is required."""
+    """Being 群主 does not authorize commands; QQ bind is required."""
     store = ImpressionStore(tmp_path / "impressions")
     router = CommandRouter(OwnerGate("10001", tmp_path), store)
     text = router.try_handle(_group("/impression 白糖", role="owner"))
     assert text is not None
-    assert "QQ_ID" in text
-    assert "群主" in text
+    assert "管理员" in text
 
 
 def test_bind_wrong_qq_rejected(tmp_path: Path) -> None:
@@ -69,10 +68,10 @@ def test_bind_wrong_qq_rejected(tmp_path: Path) -> None:
     router = CommandRouter(OwnerGate("10001", tmp_path), store)
     text = router.try_handle(_c2c("/bind 99999"))
     assert text is not None
-    assert "不一致" in text
+    assert "不一致" in text or "不在管理员列表" in text
     denied = router.try_handle(_c2c("/impression 小明"))
     assert denied is not None
-    assert "QQ_ID" in denied
+    assert "管理员" in denied
 
 
 def test_group_command_after_c2c_bind(tmp_path: Path) -> None:

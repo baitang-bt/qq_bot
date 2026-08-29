@@ -1,6 +1,8 @@
 """Reply policy gates: kinds, keywords, and per-session rate limits."""
 
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from app.qq.events import (
     C2C_EVENT,
@@ -9,7 +11,7 @@ from app.qq.events import (
     Attachment,
     IncomingMessage,
 )
-from app.reply_policy import ReplyGate, load_reply_settings
+from app.reply_policy import ReplyGate, is_beijing_unmentioned_peak, load_reply_settings
 
 
 def _c2c(content: str = "你好", attachments: tuple[Attachment, ...] = ()) -> IncomingMessage:
@@ -110,8 +112,56 @@ def _group_plain(content: str) -> IncomingMessage:
     )
 
 
+def test_beijing_peak_hours_window() -> None:
+    """Mon-Fri 09:00-12:00 and 14:00-18:00 Beijing are peak; lunch and weekends are not."""
+    tz = ZoneInfo("Asia/Shanghai")
+    monday_9 = datetime(2026, 8, 31, 9, 0, tzinfo=tz).timestamp()
+    monday_10 = datetime(2026, 8, 31, 10, 0, tzinfo=tz).timestamp()
+    monday_12 = datetime(2026, 8, 31, 12, 0, tzinfo=tz).timestamp()
+    monday_lunch = datetime(2026, 8, 31, 13, 0, tzinfo=tz).timestamp()
+    monday_14 = datetime(2026, 8, 31, 14, 0, tzinfo=tz).timestamp()
+    monday_15 = datetime(2026, 8, 31, 15, 0, tzinfo=tz).timestamp()
+    monday_18 = datetime(2026, 8, 31, 18, 0, tzinfo=tz).timestamp()
+    saturday_10 = datetime(2026, 8, 29, 10, 0, tzinfo=tz).timestamp()
+    assert is_beijing_unmentioned_peak(monday_9) is True
+    assert is_beijing_unmentioned_peak(monday_10) is True
+    assert is_beijing_unmentioned_peak(monday_12) is False
+    assert is_beijing_unmentioned_peak(monday_lunch) is False
+    assert is_beijing_unmentioned_peak(monday_14) is True
+    assert is_beijing_unmentioned_peak(monday_15) is True
+    assert is_beijing_unmentioned_peak(monday_18) is False
+    assert is_beijing_unmentioned_peak(saturday_10) is False
+
+
+def test_unmentioned_blocked_during_beijing_peak(tmp_path: Path) -> None:
+    """Un-@ named messages are skipped during weekday peak hours when off_peak_only is on."""
+    path = tmp_path / "reply_policy.toml"
+    path.write_text(
+        "group_unmentioned = true\nunmentioned_off_peak_only = true\n"
+        "unmentioned_need_hook = true\nbot_names = [\"0x01\"]\n"
+        "max_per_session_per_minute = 10\n",
+        encoding="utf-8",
+    )
+    gate = ReplyGate(path)
+    peak = datetime(2026, 8, 31, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()
+    off_peak = datetime(2026, 8, 31, 20, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()
+    assert gate.decide(_group_plain("0x01 这怎么弄？"), now=peak) == "unmentioned_peak_hours"
+    assert gate.decide(_group_plain("0x01 这怎么弄？"), now=off_peak) is None
+
+
+def test_unmentioned_skips_bare_question(tmp_path: Path) -> None:
+    """Questions without bot name or prior thread are ignored."""
+    path = tmp_path / "reply_policy.toml"
+    path.write_text(
+        "group_unmentioned = true\nunmentioned_need_hook = true\nbot_names = [\"0x01\"]\n",
+        encoding="utf-8",
+    )
+    gate = ReplyGate(path)
+    assert gate.decide(_group_plain("这怎么弄？"), now=1.0) == "unmentioned_no_hook"
+
+
 def test_unmentioned_skips_chatter(tmp_path: Path) -> None:
-    """Idle group chat without a question or bot name is ignored."""
+    """Idle group chat without bot name or thread is ignored."""
     path = tmp_path / "reply_policy.toml"
     path.write_text(
         "group_unmentioned = true\nunmentioned_need_hook = true\nbot_names = [\"0x01\"]\n",
@@ -121,30 +171,78 @@ def test_unmentioned_skips_chatter(tmp_path: Path) -> None:
     assert gate.decide(_group_plain("我先下班了"), now=1.0) == "unmentioned_no_hook"
 
 
-def test_unmentioned_question_has_cooldown(tmp_path: Path) -> None:
-    """Un-@ questions can be answered, then the same group waits ~5s."""
+def test_unmentioned_allows_bot_name(tmp_path: Path) -> None:
+    """Naming the bot in text allows an un-@ reply."""
     path = tmp_path / "reply_policy.toml"
     path.write_text(
-        "group_unmentioned = true\nunmentioned_cooldown_seconds = 5\n"
-        "unmentioned_need_hook = true\nmax_per_session_per_minute = 10\n",
+        "group_unmentioned = true\nunmentioned_need_hook = true\nbot_names = [\"0x01\"]\n"
+        "max_per_session_per_minute = 10\n",
         encoding="utf-8",
     )
     gate = ReplyGate(path)
-    assert gate.decide(_group_plain("这怎么弄？"), now=100.0) is None
-    assert gate.decide(_group_plain("还有谁会？"), now=102.0) == "unmentioned_cooldown"
-    assert gate.decide(_group_plain("那要怎么做？"), now=106.0) is None
+    assert gate.decide(_group_plain("0x01 在吗"), now=1.0) is None
+
+
+def test_unmentioned_thread_continuation(tmp_path: Path) -> None:
+    """After bot replied, follow-up un-@ lines in the same thread are allowed."""
+    path = tmp_path / "reply_policy.toml"
+    path.write_text(
+        "group_unmentioned = true\nunmentioned_need_hook = true\nbot_names = [\"0x01\"]\n"
+        "unmentioned_thread_minutes = 30\nmax_per_session_per_minute = 10\n"
+        "unmentioned_cooldown_seconds = 0\n",
+        encoding="utf-8",
+    )
+    gate = ReplyGate(path)
+    msg = _group_plain("好的那继续")
+    gate.note_bot_reply(msg.session_id, now=100.0)
+    assert gate.decide(_group_plain("测试一下非@回复"), now=120.0) is None
+    assert gate.decide(_group_plain("哑巴了"), now=121.0) is None
+    assert gate.decide(_group_plain("我先下班了"), now=122.0) == "unmentioned_no_hook"
+
+
+def test_unmentioned_named_has_cooldown(tmp_path: Path) -> None:
+    """Un-@ messages naming the bot can be answered, then the same group waits ~5s."""
+    path = tmp_path / "reply_policy.toml"
+    path.write_text(
+        "group_unmentioned = true\nunmentioned_cooldown_seconds = 5\n"
+        "unmentioned_need_hook = true\nbot_names = [\"0x01\"]\n"
+        "max_per_session_per_minute = 10\n",
+        encoding="utf-8",
+    )
+    gate = ReplyGate(path)
+    assert gate.decide(_group_plain("0x01 这怎么弄？"), now=100.0) is None
+    gate.note_unmentioned_reply("group-b", now=100.0)
+    assert gate.decide(_group_plain("0x01 还有谁会？"), now=102.0) == "unmentioned_cooldown"
+    assert gate.decide(_group_plain("0x01 那要怎么做？"), now=106.0) is None
+
+
+def test_unmentioned_cooldown_starts_after_reply(tmp_path: Path) -> None:
+    """Passing decide() alone must not start the un-@ group cooldown."""
+    path = tmp_path / "reply_policy.toml"
+    path.write_text(
+        "group_unmentioned = true\nunmentioned_cooldown_seconds = 5\n"
+        "unmentioned_need_hook = false\nmax_per_session_per_minute = 10\n",
+        encoding="utf-8",
+    )
+    gate = ReplyGate(path)
+    assert gate.decide(_group_plain("第一条"), now=100.0) is None
+    assert gate.decide(_group_plain("第二条"), now=102.0) is None
+    gate.note_unmentioned_reply("group-b", now=100.0)
+    assert gate.decide(_group_plain("第三条"), now=102.0) == "unmentioned_cooldown"
 
 
 def test_at_mention_skips_unmentioned_cooldown(tmp_path: Path) -> None:
     """@ the bot still replies even if an un-@ reply just happened."""
     path = tmp_path / "reply_policy.toml"
     path.write_text(
+        "group_unmentioned = true\nunmentioned_need_hook = true\nbot_names = [\"0x01\"]\n"
         "unmentioned_cooldown_seconds = 5\nmin_interval_seconds = 0\n"
         "max_per_session_per_minute = 10\n",
         encoding="utf-8",
     )
     gate = ReplyGate(path)
-    assert gate.decide(_group_plain("有人在吗？"), now=200.0) is None
+    assert gate.decide(_group_plain("0x01 有人在吗？"), now=200.0) is None
+    gate.note_unmentioned_reply("group-b", now=200.0)
     mentioned = IncomingMessage(
         event_type=GROUP_AT_EVENT,
         event_id="e4",
@@ -155,6 +253,31 @@ def test_at_mention_skips_unmentioned_cooldown(tmp_path: Path) -> None:
         attachments=(),
     )
     assert gate.decide(mentioned, now=201.0) is None
+
+
+def test_quote_bot_allowed_during_beijing_peak(tmp_path: Path) -> None:
+    """Quoting the bot bypasses weekday peak-hour block for plain un-@ messages."""
+    path = tmp_path / "reply_policy.toml"
+    path.write_text(
+        "group_unmentioned = true\nunmentioned_off_peak_only = true\n"
+        "unmentioned_need_hook = true\nbot_names = [\"0x01\"]\n"
+        "max_per_session_per_minute = 10\n",
+        encoding="utf-8",
+    )
+    gate = ReplyGate(path)
+    peak = datetime(2026, 8, 31, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()
+    quoted = IncomingMessage(
+        event_type=GROUP_MESSAGE_EVENT,
+        event_id="e5",
+        msg_id="m5",
+        content="怎么这个像豆包",
+        user_openid="user-a",
+        group_openid="group-b",
+        attachments=(),
+        quotes_bot=True,
+    )
+    assert gate.decide(quoted, now=peak) is None
+    assert gate.decide(_group_plain("随便聊聊"), now=peak) == "unmentioned_peak_hours"
 
 
 def test_require_and_skip_keywords(tmp_path: Path) -> None:

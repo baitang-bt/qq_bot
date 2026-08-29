@@ -9,7 +9,7 @@ group = true
 
 # 内容类型（语音走事件里的 asr_refer_text，没有官方单独 ASR HTTP）
 on_text = true
-on_image = true
+on_image = false
 on_voice = true
 
 # 同一会话：两次回复至少隔这么多秒；一分钟最多几条
@@ -22,9 +22,13 @@ require_keywords = []
 # 包含这些词就不回
 skip_keywords = []
 
-# 未@的群消息。开放平台必须开启「接收所有消息」，才会推 GROUP_MESSAGE_CREATE。
+# 未@的群消息。WebSocket 模式在手机 QQ 群机器人设置里开「获取群内全部消息」即可推 GROUP_MESSAGE_CREATE。
 group_unmentioned = true
-unmentioned_cooldown_seconds = 5
-# true：没@时只在提问/点名时才回，避免每句都打模型
-unmentioned_need_hook = true
-bot_names = ["0x01"]
+unmentioned_cooldown_seconds = 0
+# true：未@时只在点名或延续近期对话时才回；false=收到全量群消息后常态回复
+unmentioned_need_hook = false
+# 与某用户对话后，多少分钟内可识别未@的延续句
+unmentioned_thread_minutes = 1
+# 北京时间周一至周五 9:00-12:00、14:00-18:00 仅拦截「非@且未引用 bot」消息；@ 与引用 bot 仍回复
+unmentioned_off_peak_only = true
+bot_names = ["0x01", "bot"]

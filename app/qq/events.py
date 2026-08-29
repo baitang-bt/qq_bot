@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.qq import message_cache
 
 C2C_EVENT = "C2C_MESSAGE_CREATE"
 GROUP_AT_EVENT = "GROUP_AT_MESSAGE_CREATE"
@@ -37,6 +38,10 @@ class IncomingMessage:
     username: str = ""
     member_role: str = ""
     quote_id: str = ""
+    ref_msg_idx: str = ""
+    quoted_text: str = ""
+    quotes_bot: bool = False
+    message_type: int = 0
     attachments: tuple[Attachment, ...] = field(default_factory=tuple)
 
     @property
@@ -91,12 +96,19 @@ class IncomingMessage:
 
     @property
     def user_text(self) -> str:
-        """Text the model should treat as the user's utterance (typed or ASR)."""
+        """Text the model should treat as the user's utterance (typed, ASR, or quote)."""
         typed = self.content.strip()
         asr = self.asr_text
         if typed and asr:
-            return f"{typed}\n{asr}"
-        return typed or asr
+            body = f"{typed}\n{asr}"
+        else:
+            body = typed or asr
+        quote = self.quoted_text.strip()
+        if not quote:
+            return body
+        if body:
+            return f"[引用]\n{quote}\n\n[消息]\n{body}"
+        return f"[引用]\n{quote}"
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -155,24 +167,178 @@ def _member_role(author: dict[str, Any]) -> str:
     return ""
 
 
+def _parse_scene_ext(scene: dict[str, Any]) -> dict[str, str]:
+    """Read message_scene.ext key=value pairs (msg_idx, ref_msg_idx, …)."""
+    result: dict[str, str] = {}
+    ext = scene.get("ext")
+    if not isinstance(ext, list):
+        return result
+    for item in ext:
+        if not isinstance(item, str) or "=" not in item:
+            continue
+        key, _, value = item.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key and value:
+            result[key] = value
+    return result
+
+
 def _quote_id(data: dict[str, Any], msg_id: str) -> str:
     """Pick the id used for quote replies: scene msg_idx, else the event msg_id."""
     scene = _as_dict(data.get("message_scene"))
-    ext = scene.get("ext")
-    if isinstance(ext, list):
-        for item in ext:
-            if not isinstance(item, str) or not item.startswith("msg_idx="):
-                continue
-            value = item.split("=", 1)[1].strip()
-            if value:
-                return value
+    ext = _parse_scene_ext(scene)
+    msg_idx = ext.get("msg_idx", "").strip()
+    if msg_idx:
+        return msg_idx
     return msg_id
+
+
+def _merge_attachments(*groups: tuple[Attachment, ...]) -> tuple[Attachment, ...]:
+    """Concatenate attachment tuples while dropping obvious duplicates."""
+    seen: set[str] = set()
+    merged: list[Attachment] = []
+    for group in groups:
+        for item in group:
+            key = item.url or item.filename or item.asr_refer_text
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            merged.append(item)
+    return tuple(merged)
+
+
+def _collect_msg_elements_body(raw: Any) -> tuple[str, tuple[Attachment, ...]]:
+    """Extract inline text and attachments from parallel/compound msg_elements."""
+    if not isinstance(raw, list):
+        return "", ()
+    texts: list[str] = []
+    attachments: list[Attachment] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        content = str(entry.get("content") or "").strip()
+        if content:
+            texts.append(content)
+        attachments.extend(_parse_attachments(entry.get("attachments")))
+        nested_text, nested_attachments = _collect_msg_elements_body(entry.get("msg_elements"))
+        if nested_text:
+            texts.append(nested_text)
+        attachments.extend(nested_attachments)
+    return "\n".join(texts).strip(), tuple(attachments)
+
+
+def _extract_msg_elements_text(raw: Any) -> str:
+    """Flatten nested msg_elements into one quoted-text block."""
+    if not isinstance(raw, list):
+        return ""
+    parts: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        content = str(entry.get("content") or "").strip()
+        if content:
+            parts.append(content)
+        nested = _extract_msg_elements_text(entry.get("msg_elements"))
+        if nested:
+            parts.append(nested)
+        for attachment in _parse_attachments(entry.get("attachments")):
+            asr = attachment.asr_refer_text.strip()
+            if asr:
+                parts.append(asr)
+    return "\n".join(parts).strip()
+
+
+def _msg_elements_quote_bot_author(raw: Any) -> bool:
+    """True when nested msg_elements mark the quoted author as the bot."""
+    if not isinstance(raw, list):
+        return False
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        author = _as_dict(entry.get("author"))
+        if author.get("bot") is True:
+            return True
+        if _msg_elements_quote_bot_author(entry.get("msg_elements")):
+            return True
+    return False
+
+
+def _detect_quotes_bot(
+    data: dict[str, Any],
+    scene_ext: dict[str, str],
+    message_type: int,
+    quoted_text: str,
+    *,
+    group_openid: str | None,
+    user_openid: str,
+) -> bool:
+    """True when the user quoted a recent bot message in this chat."""
+    ref_idx = scene_ext.get("ref_msg_idx", "").strip()
+    if ref_idx and message_cache.is_bot_msg_idx(ref_idx):
+        return True
+    if message_type == 103 or ref_idx:
+        if _msg_elements_quote_bot_author(data.get("msg_elements")):
+            return True
+    if quoted_text.strip():
+        return message_cache.quoted_matches_bot(
+            quoted_text,
+            group_openid=group_openid,
+            user_openid=user_openid,
+        )
+    return False
+
+
+def _resolve_quoted_text(
+    data: dict[str, Any],
+    scene_ext: dict[str, str],
+    message_type: int,
+) -> str:
+    """Read quoted message text for type 103 / ref_msg_idx, not parallel bodies."""
+    if message_type != 103 and not scene_ext.get("ref_msg_idx", "").strip():
+        return ""
+    quoted = _extract_msg_elements_text(data.get("msg_elements"))
+    if quoted:
+        return quoted
+    ref_idx = scene_ext.get("ref_msg_idx", "").strip()
+    if ref_idx:
+        return message_cache.lookup(ref_idx)
+    return ""
+
+
+def _merge_content_with_elements(content: str, element_text: str) -> str:
+    """Combine top-level content with inline msg_elements text without duplication."""
+    base = content.strip()
+    extra = element_text.strip()
+    if not extra:
+        return base
+    if not base:
+        return extra
+    if extra in base or base in extra:
+        return base if len(base) >= len(extra) else extra
+    return f"{base}\n{extra}"
+
+
+def _remember_for_quotes(
+    msg_idx: str,
+    content: str,
+    asr_text: str,
+    quoted_text: str,
+) -> None:
+    """Cache this message's own body so later ref_msg_idx lookups can succeed."""
+    body = content.strip() or asr_text.strip()
+    if body:
+        message_cache.remember(msg_idx, body)
+        return
+    if quoted_text.strip():
+        message_cache.remember(msg_idx, quoted_text.strip())
 
 
 def parse_incoming(payload: dict[str, Any]) -> IncomingMessage | None:
     """Turn a webhook JSON body into IncomingMessage, or None if not a chat event."""
     opcode = payload.get("op")
-    event_type = str(payload.get("t") or "")
+    event_type = str(payload.get("t") or "").upper()
     if opcode not in (0, None) and event_type not in _CHAT_EVENTS:
         if opcode != 0:
             return None
@@ -193,25 +359,105 @@ def parse_incoming(payload: dict[str, Any]) -> IncomingMessage | None:
     msg_id = str(data.get("id") or "")
     if not user_openid or not msg_id:
         return None
-    attachments = _parse_attachments(data.get("attachments")) or _parse_attachments(
-        data.get("attachments")
-    )
+    attachments = _parse_attachments(data.get("attachments"))
+    message_type = int(data.get("message_type") or 0)
+    element_text = ""
+    element_attachments: tuple[Attachment, ...] = ()
+    if message_type in {101, 102}:
+        element_text, element_attachments = _collect_msg_elements_body(data.get("msg_elements"))
+        attachments = _merge_attachments(attachments, element_attachments)
+    elif message_type != 103:
+        element_text, element_attachments = _collect_msg_elements_body(data.get("msg_elements"))
+        if element_attachments:
+            attachments = _merge_attachments(attachments, element_attachments)
     group_openid = str(data.get("group_openid") or "") or None
     if event_type in {GROUP_AT_EVENT, GROUP_MESSAGE_EVENT} and not group_openid:
         return None
     if event_type == C2C_EVENT:
         group_openid = None
+    scene = _as_dict(data.get("message_scene"))
+    scene_ext = _parse_scene_ext(scene)
+    msg_idx = scene_ext.get("msg_idx", "").strip() or msg_id
+    content = _merge_content_with_elements(
+        str(data.get("content") or "").strip(),
+        element_text,
+    )
+    quoted_text = _resolve_quoted_text(data, scene_ext, message_type)
+    asr_parts = [
+        item.asr_refer_text.strip()
+        for item in attachments
+        if item.asr_refer_text.strip()
+    ]
+    asr_text = " ".join(asr_parts).strip()
+    _remember_for_quotes(msg_idx, content, asr_text, quoted_text)
+    quotes_bot = _detect_quotes_bot(
+        data,
+        scene_ext,
+        message_type,
+        quoted_text,
+        group_openid=group_openid,
+        user_openid=user_openid,
+    )
     return IncomingMessage(
         event_type=event_type,
         event_id=str(payload.get("id") or ""),
         msg_id=msg_id,
-        content=str(data.get("content") or "").strip(),
+        content=content,
         user_openid=user_openid,
         username=str(author.get("username") or ""),
         group_openid=group_openid,
         member_role=_member_role(author),
         quote_id=_quote_id(data, msg_id),
+        ref_msg_idx=scene_ext.get("ref_msg_idx", "").strip(),
+        quoted_text=quoted_text,
+        quotes_bot=quotes_bot,
+        message_type=message_type,
         attachments=attachments,
+    )
+
+
+def merge_inbound_messages(messages: list[IncomingMessage]) -> IncomingMessage:
+    """Combine a burst of consecutive user lines; passive reply uses the latest msg_id."""
+    if not messages:
+        raise ValueError("merge_inbound_messages requires at least one message")
+    if len(messages) == 1:
+        return messages[0]
+    last = messages[-1]
+    texts: list[str] = []
+    for item in messages:
+        text = item.user_text.strip()
+        if text and (not texts or texts[-1] != text):
+            texts.append(text)
+    attachments: list[Attachment] = []
+    seen: set[str] = set()
+    for item in messages:
+        for attachment in item.attachments:
+            key = attachment.url or attachment.filename or attachment.asr_refer_text
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            attachments.append(attachment)
+    mentioned = any(item.mentioned for item in messages)
+    quotes_bot = any(item.quotes_bot for item in messages)
+    event_type = last.event_type
+    if mentioned and last.is_group and event_type == GROUP_MESSAGE_EVENT:
+        event_type = GROUP_AT_EVENT
+    return IncomingMessage(
+        event_type=event_type,
+        event_id=last.event_id,
+        msg_id=last.msg_id,
+        content="\n".join(texts) if texts else last.content,
+        user_openid=last.user_openid,
+        group_openid=last.group_openid,
+        username=last.username,
+        member_role=last.member_role,
+        quote_id=last.quote_id,
+        ref_msg_idx=last.ref_msg_idx,
+        quoted_text=last.quoted_text,
+        quotes_bot=quotes_bot,
+        message_type=last.message_type,
+        attachments=tuple(attachments),
     )
 
 

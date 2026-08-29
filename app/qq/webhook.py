@@ -135,6 +135,6 @@ def _ack() -> Response:
 async def _run_bot(bot: ChatBot, message: Any) -> None:
     """Background task wrapper so webhook ACK is not delayed by the model."""
     try:
-        await bot.handle(message)
+        await bot.enqueue(message)
     except Exception:
         _log.exception("bot handle failed msg_id=%s", getattr(message, "msg_id", ""))

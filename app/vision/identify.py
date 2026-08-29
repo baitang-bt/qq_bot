@@ -125,6 +125,15 @@ class ImageIdentifier:
             response.raise_for_status()
             text = str(response.json()["choices"][0]["message"]["content"]).strip()
             return text or "图里没什么能说的"
+        except httpx.HTTPStatusError as exc:
+            body = exc.response.text[:500]
+            _log.error(
+                "vision call failed model=%s status=%s body=%s",
+                self._settings.vision_model,
+                exc.response.status_code,
+                body,
+            )
+            return "图没看清"
         except Exception:
             _log.exception("vision call failed")
             return "图没看清"

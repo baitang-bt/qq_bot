@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import defaultdict
 
 import httpx
 
 from app.config import Settings
+from app.qq import message_cache
 from app.qq.events import IncomingMessage
 from app.qq.token import TokenManager
 
@@ -27,13 +29,53 @@ class ReplyClient:
         self._seq[msg_id] += 1
         return self._seq[msg_id]
 
-    async def send_text(self, message: IncomingMessage, text: str) -> None:
-        """Send a passive text reply that quotes the inbound message."""
+    async def send_text(
+        self,
+        message: IncomingMessage,
+        text: str,
+        *,
+        quote: bool = True,
+    ) -> bool:
+        """Send a passive text reply; only the first bubble should quote inbound."""
         body = (text or "").strip()
         if not body:
-            return
+            return False
         seq = self.next_seq(message.msg_id)
-        await self._post(message, build_text_payload(message, body, seq))
+        return await self._post(message, build_text_payload(message, body, seq, quote=quote))
+
+    async def send_bubbles(
+        self,
+        message: IncomingMessage,
+        bubbles: list[str],
+        *,
+        quote_first: bool = True,
+    ) -> bool:
+        """Send multiple short bubbles with human-like pauses between them."""
+        cleaned = [part.strip() for part in bubbles if part and part.strip()]
+        if not cleaned:
+            return False
+        delivered = False
+        for index, bubble in enumerate(cleaned):
+            if index > 0:
+                delay = min(3.0, max(0.6, len(bubble) * 0.06))
+                if not message.is_group:
+                    try:
+                        await self.send_c2c_typing(
+                            message,
+                            seconds=min(60, int(delay) + 2),
+                        )
+                    except Exception:
+                        _log.warning("typing between bubbles failed", exc_info=True)
+                await asyncio.sleep(delay)
+            if await self.send_text(
+                message,
+                bubble,
+                quote=(index == 0 and quote_first),
+            ):
+                delivered = True
+            else:
+                return delivered
+        return delivered
 
     async def send_c2c_typing(self, message: IncomingMessage, seconds: int = 20) -> None:
         """Show a C2C 'typing' indicator. Group chats have no equivalent."""
@@ -48,7 +90,7 @@ class ReplyClient:
         }
         await self._post(message, payload)
 
-    async def _post(self, message: IncomingMessage, payload: dict) -> None:
+    async def _post(self, message: IncomingMessage, payload: dict) -> bool:
         """POST a message payload to the C2C or group messages endpoint."""
         if message.is_group:
             path = f"/v2/groups/{message.group_openid}/messages"
@@ -64,17 +106,57 @@ class ReplyClient:
                 response.status_code,
                 response.text[:400],
             )
-            response.raise_for_status()
+            return False
+        text = str(payload.get("content") or "").strip()
+        if text:
+            out_id = ""
+            try:
+                body = response.json()
+                if isinstance(body, dict):
+                    out_id = str(body.get("id") or body.get("msg_id") or "")
+            except ValueError:
+                out_id = ""
+            message_cache.remember_bot(
+                out_id,
+                text,
+                group_openid=message.group_openid,
+                user_openid=message.user_openid,
+            )
+        return True
 
 
-def build_text_payload(message: IncomingMessage, text: str, seq: int) -> dict:
-    """Build a text send body that quotes the target inbound message."""
+def user_turns_since_last_bot(history: list[dict[str, str]]) -> int:
+    """Count user lines since the last assistant turn, including the inbound being answered."""
+    count = 1
+    for turn in reversed(history):
+        if turn["role"] == "assistant":
+            break
+        if turn["role"] == "user":
+            count += 1
+    return count
+
+
+def should_quote_inbound(history: list[dict[str, str]], *, max_unquoted_gap: int = 3) -> bool:
+    """Return True when the reply should quote the inbound QQ message (gap > max_unquoted_gap)."""
+    return user_turns_since_last_bot(history) > max_unquoted_gap
+
+
+def build_text_payload(
+    message: IncomingMessage,
+    text: str,
+    seq: int,
+    *,
+    quote: bool = True,
+) -> dict:
+    """Build a text send body; optionally quote the target inbound message."""
     payload = {
         "content": text[:1500],
         "msg_type": 0,
         "msg_id": message.msg_id,
         "msg_seq": seq,
     }
+    if not quote:
+        return payload
     quote_id = (message.quote_id or message.msg_id).strip()
     if quote_id:
         payload["message_reference"] = {

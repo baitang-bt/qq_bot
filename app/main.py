@@ -19,6 +19,7 @@ from app.llm.client import LLMClient
 from app.memory.store import MemoryStore
 from app.qq.dedupe import MessageDedupe
 from app.qq.gateway import QQGateway
+from app.qq.gateway_stats import MONITOR
 from app.qq.reply import ReplyClient
 from app.qq.token import TokenManager
 from app.qq.webhook import create_webhook_router
@@ -54,6 +55,7 @@ def create_app() -> FastAPI:
         impressions=impressions,
         impression_writer=writer,
         commands=commands,
+        settings=settings,
     )
     dedupe = MessageDedupe()
     gateway = QQGateway(settings, tokens, bot, dedupe)
@@ -78,9 +80,9 @@ def create_app() -> FastAPI:
     app.include_router(create_webhook_router(settings, bot, dedupe))
 
     @app.get("/health")
-    def health() -> dict[str, str]:
-        """Liveness probe for tunnels and process managers."""
-        return {"status": "ok"}
+    def health() -> dict[str, object]:
+        """Liveness probe plus gateway event counters for the admin UI."""
+        return {"status": "ok", "gateway": MONITOR.snapshot()}
 
     return app
 

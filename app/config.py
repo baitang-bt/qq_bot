@@ -46,6 +46,9 @@ class Settings:
     qq_id: str
     host: str
     port: int
+    coalesce_burst_seconds: float
+    coalesce_debounce_seconds: float
+    coalesce_single_debounce_seconds: float
 
 
 def load_settings() -> Settings:
@@ -72,4 +75,9 @@ def load_settings() -> Settings:
         qq_id=_env("QQ_ID"),
         host=_env("HOST", "0.0.0.0"),
         port=_env_int("PORT", 8080),
+        coalesce_burst_seconds=float(_env("COALESCE_BURST_SECONDS", "30")),
+        coalesce_debounce_seconds=float(_env("COALESCE_DEBOUNCE_SECONDS", "3.0")),
+        coalesce_single_debounce_seconds=float(
+            _env("COALESCE_SINGLE_DEBOUNCE_SECONDS", "3.0")
+        ),
     )
