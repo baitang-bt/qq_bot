@@ -39,6 +39,8 @@ def _settings(tmp_path: Path) -> Settings:
         coalesce_single_debounce_seconds=3.0,
         stickers_dir=tmp_path / "stickers",
         stickers_index_path=tmp_path / "stickers.toml",
+        sticker_auto_learn=True,
+        sticker_learn_max=200,
     )
 
 

@@ -116,6 +116,8 @@ description = "一只猫捂脸，无奈"
 
 模型回复里写出 `[[sticker:facepalm]]` 时，机器人会发出对应图片。只支持 PNG/JPG。目录和清单路径可用 `STICKERS_DIR`、`STICKERS_INDEX_PATH` 覆盖。
 
+收到的表情包默认会让模型判断是否值得留下（`STICKER_AUTO_LEARN`，默认开启）。值得留下时写入 `data/stickers/` 和 `stickers.toml`，同一张图之后直接用本地描述。学习条数上限是 `STICKER_LEARN_MAX`（默认 200）。
+
 ## 回复策略
 
 改 `reply_policy.toml`，保存后下一条消息重读，不用重启。常用项：

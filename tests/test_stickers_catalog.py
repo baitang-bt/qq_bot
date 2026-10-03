@@ -20,13 +20,17 @@ def test_catalog_loads_existing_file(tmp_path: Path) -> None:
     _png(stickers / "facepalm.png")
     index = tmp_path / "stickers.toml"
     index.write_text(
-        '[[sticker]]\nid = "facepalm"\nfile = "facepalm.png"\ntags = ["捂脸"]\n',
+        '[[sticker]]\nid = "facepalm"\nfile = "facepalm.png"\n'
+        'tags = ["捂脸"]\ndescription = "一只猫捂脸"\n',
         encoding="utf-8",
     )
     catalog = StickerCatalog(index, stickers)
     assert catalog.path_for("facepalm") == (stickers / "facepalm.png").resolve()
     assert catalog.known_ids() == ["facepalm"]
-    assert "[[sticker:facepalm]]" in catalog.prompt_block()
+    assert catalog.description_for_id("facepalm") == "一只猫捂脸"
+    block = catalog.prompt_block()
+    assert "[[sticker:facepalm]]" in block
+    assert "一只猫捂脸" in block
 
 
 def test_catalog_skips_missing_file(tmp_path: Path) -> None:

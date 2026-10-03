@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.config import Settings
-from app.llm.client import LLMClient
+from app.llm.client import LLMClient, _parse_sticker_triage
 
 
 def _client(tmp_path: Path) -> LLMClient:
@@ -168,16 +168,20 @@ def test_complete_with_notes_appends_sticker_text(tmp_path: Path) -> None:
 
 
 def test_describe_image_sends_multimodal_sticker_payload(tmp_path: Path) -> None:
-    """describe_image uses deepseek-flash multimodal with thinking disabled."""
+    """describe_image uses triage multimodal with thinking disabled."""
     client = _client(tmp_path)
     captured: dict = {}
     jpeg = b"fakejpeg"
+    triage_json = (
+        '{"description":"捂脸猫","save":false,"id":"facepalm_cat",'
+        '"tags":["捂脸"],"reason":"ok"}'
+    )
 
     async def run() -> str:
         mock_response = MagicMock()
         mock_response.raise_for_status = MagicMock()
         mock_response.json = MagicMock(
-            return_value={"choices": [{"message": {"content": "捂脸猫"}}]}
+            return_value={"choices": [{"message": {"content": triage_json}}]}
         )
 
         async def fake_post(*_args, **kwargs):
@@ -194,3 +198,23 @@ def test_describe_image_sends_multimodal_sticker_payload(tmp_path: Path) -> None
     content = body["messages"][-1]["content"]
     assert content[1]["type"] == "image_url"
     assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+def test_parse_sticker_triage_save_true() -> None:
+    """Valid triage JSON sets save, id, tags, and description."""
+    result = _parse_sticker_triage(
+        '{"description":"一只猫捂脸","save":true,"id":"facepalm_cat",'
+        '"tags":["捂脸","无奈"],"reason":"通用"}'
+    )
+    assert result.save is True
+    assert result.description == "一只猫捂脸"
+    assert result.sticker_id == "facepalm_cat"
+    assert result.tags == ("捂脸", "无奈")
+
+
+def test_parse_sticker_triage_invalid_keeps_text() -> None:
+    """Non-JSON prose becomes description only; save stays false."""
+    result = _parse_sticker_triage("一只猫在捂脸，无奈")
+    assert result.save is False
+    assert result.description == "一只猫在捂脸，无奈"
+    assert result.reason == "parse_error"
