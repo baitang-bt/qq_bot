@@ -1,14 +1,15 @@
-"""SQLite cache of image descriptions keyed by fileid / hex / md5."""
+"""SQLite cache helpers for image-related rows (legacy description cache cleanup)."""
 
 from __future__ import annotations
 
 import sqlite3
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 
 class ImageCache:
-    """Store vision descriptions so the same sticker is not identified twice."""
+    """Legacy sticker description cache; multimodal path no longer writes failures here."""
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
@@ -48,7 +49,7 @@ class ImageCache:
         return str(row[0]) if row else None
 
     def put(self, keys: list[str], description: str, source: str = "") -> None:
-        """Write the same description under every provided key."""
+        """Write the same description under every provided key (skips empty text)."""
         text = (description or "").strip()
         if not text or not keys:
             return
@@ -66,9 +67,15 @@ class ImageCache:
                     (key, text, source, now),
                 )
 
-    put = put
-    get = get
-
-
-ImageCache.put = ImageCache.put
-ImageCache.get = ImageCache.get
+    def purge_descriptions(self, descriptions: Iterable[str]) -> int:
+        """Delete rows whose description matches any of the given failure strings."""
+        targets = [item.strip() for item in descriptions if item and item.strip()]
+        if not targets:
+            return 0
+        placeholders = ",".join("?" for _ in targets)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                f"DELETE FROM image_cache WHERE description IN ({placeholders})",
+                targets,
+            )
+            return int(cursor.rowcount or 0)

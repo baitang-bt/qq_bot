@@ -86,6 +86,39 @@ def test_voice_without_asr_skipped() -> None:
     assert gate.decide(message, now=1.0) == "voice_no_asr"
 
 
+def test_pure_image_allowed_when_on_image(tmp_path: Path) -> None:
+    """Image-only messages pass the gate when on_image=true."""
+    path = tmp_path / "reply_policy.toml"
+    path.write_text(
+        "on_image = true\nmax_per_session_per_minute = 10\n",
+        encoding="utf-8",
+    )
+    gate = ReplyGate(path)
+    image = Attachment(
+        url="https://example.com/a.png",
+        filename="a.png",
+        content_type="image/png",
+        size=12,
+    )
+    message = _c2c(content="", attachments=(image,))
+    assert gate.decide(message, now=1.0) is None
+
+
+def test_pure_image_blocked_when_on_image_false(tmp_path: Path) -> None:
+    """Image-only messages are skipped when on_image=false."""
+    path = tmp_path / "reply_policy.toml"
+    path.write_text("on_image = false\n", encoding="utf-8")
+    gate = ReplyGate(path)
+    image = Attachment(
+        url="https://example.com/a.png",
+        filename="a.png",
+        content_type="image/png",
+        size=12,
+    )
+    message = _c2c(content="", attachments=(image,))
+    assert gate.decide(message, now=1.0) == "kind_off"
+
+
 def test_min_interval(tmp_path: Path) -> None:
     """A second message inside the cooldown is skipped."""
     path = tmp_path / "reply_policy.toml"

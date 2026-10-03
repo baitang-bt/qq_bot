@@ -13,12 +13,13 @@ from app.config import Settings
 from app.qq.coalesce import MessageCoalescer
 from app.impression.store import ImpressionStore, extract_qq_from_text
 from app.impression.writer import ImpressionWriter
-from app.llm.bubbles import split_reply_bubbles
 from app.llm.client import LLMClient
 from app.memory.store import MemoryStore
 from app.qq.events import IncomingMessage
 from app.qq.reply import ReplyClient, should_quote_inbound
 from app.reply_policy import ReplyGate
+from app.stickers.catalog import StickerCatalog
+from app.stickers.markers import memory_text_for_segments, parse_reply_segments
 from app.vision.identify import ImageIdentifier
 
 _log = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ class ChatBot:
         impression_writer: ImpressionWriter,
         commands: CommandRouter,
         settings: Settings | None = None,
+        stickers: StickerCatalog | None = None,
     ) -> None:
         self._replies = replies
         self._llm = llm
@@ -53,6 +55,7 @@ class ChatBot:
         self._impressions = impressions
         self._impression_writer = impression_writer
         self._commands = commands
+        self._stickers = stickers
         burst = 30.0 if settings is None else settings.coalesce_burst_seconds
         debounce = 3.0 if settings is None else settings.coalesce_debounce_seconds
         single = 3.0 if settings is None else settings.coalesce_single_debounce_seconds
@@ -80,7 +83,7 @@ class ChatBot:
         await self._handle_turn(message)
 
     async def _handle_turn(self, message: IncomingMessage) -> None:
-        """Identify images if needed, then reply with a chat completion."""
+        """Resolve sticker notes / download photos, then reply with chat completion."""
         _log.info(
             "inbound t=%s mentioned=%s quotes_bot=%s session=%s user=%s text=%r images=%s",
             message.event_type,
@@ -96,6 +99,27 @@ class ChatBot:
                 await self._replies.send_c2c_typing(message, seconds=20)
             except Exception:
                 _log.warning("c2c typing failed", exc_info=True)
+        sticker_cmd = self._commands.try_sticker_send(message)
+        if sticker_cmd is not None:
+            history = self._memory.history(message.session_id)
+            quote = should_quote_inbound(history)
+            path = self._stickers.path_for(sticker_cmd) if self._stickers else None
+            if path is None:
+                await self._replies.send_text(
+                    message,
+                    f"没有本地表情「{sticker_cmd}」。检查 stickers.toml 与 data/stickers/。",
+                    quote=quote,
+                )
+            else:
+                ok = await self._replies.send_image(message, path, quote=quote)
+                if not ok:
+                    await self._replies.send_text(
+                        message,
+                        f"表情「{sticker_cmd}」发送失败，看日志。",
+                        quote=False,
+                    )
+            self._gate.note_bot_reply(message.session_id, time.time())
+            return
         command_reply = self._commands.try_handle(message)
         if command_reply is not None:
             _log.info(
@@ -123,37 +147,44 @@ class ChatBot:
             )
             return
         user_text = message.user_text
-        images = message.image_attachments
+        image_attachments = message.image_attachments
         history = self._memory.history(message.session_id)
         quote_inbound = should_quote_inbound(history)
-        notes: list[str] = []
-        if images:
-            cached = self._vision.peek_cached(images)
-            if cached is None:
-                _log.info("vision start session=%s images=%s", message.session_id, len(images))
+        sticker_notes: list[str] = []
+        image_bytes: list[tuple[bytes, str]] = []
+        if image_attachments:
+            stickers, photos = self._vision.partition(image_attachments)
+            _log.info(
+                "media start session=%s stickers=%s photos=%s (no QQ status bubble)",
+                message.session_id,
+                len(stickers),
+                len(photos),
+            )
+            if not message.is_group and (stickers or photos):
                 try:
-                    if message.is_group:
-                        await self._replies.send_text(
-                            message,
-                            "在看图",
-                            quote=quote_inbound,
-                        )
-                    else:
-                        await self._replies.send_c2c_typing(message, seconds=20)
+                    await self._replies.send_c2c_typing(message, seconds=20)
                 except Exception:
-                    _log.warning("pre-vision status reply failed", exc_info=True)
-                notes = await self._vision.describe_all(images)
-                _log.info("vision done session=%s notes=%s", message.session_id, len(notes))
-            else:
-                notes = cached
-        if not user_text and not notes:
+                    _log.warning("c2c typing before media failed", exc_info=True)
+            if stickers:
+                sticker_notes = await self._vision.resolve_sticker_notes(stickers)
+            if photos:
+                image_bytes = await self._vision.fetch_images(photos)
+                _log.info(
+                    "photo multimodal downloaded session=%s ok=%s/%s",
+                    message.session_id,
+                    len(image_bytes),
+                    len(photos),
+                )
+        if not user_text and not image_bytes and not sticker_notes:
             return
         turn_started = time.monotonic()
         _log.info(
-            "正在回复 mentioned=%s user=%s preview=%r",
+            "正在回复 mentioned=%s user=%s preview=%r photos=%s stickers=%s",
             message.mentioned,
             message.username or message.user_openid[:8],
             message.user_text[:80],
+            len(image_bytes),
+            len(sticker_notes),
         )
         spoken_qq = extract_qq_from_text(user_text)
         profile = self._impressions.touch(
@@ -161,10 +192,13 @@ class ChatBot:
             username=message.username,
             spoken_qq=spoken_qq,
         )
+        if self._stickers is not None:
+            self._llm.set_stickers_prompt(self._stickers.prompt_block())
         reply = await self._llm.complete(
             history,
             user_text,
-            notes,
+            images=image_bytes,
+            notes=sticker_notes,
             impression=str(profile.get("impression") or ""),
         )
         if not reply.strip():
@@ -173,22 +207,33 @@ class ChatBot:
         user_record = user_text
         if message.asr_text:
             user_record = f"[语音] {user_text}"
-        if notes:
-            user_record = (user_record + "\n" if user_record else "") + "\n".join(
-                f"[图] {note}" for note in notes
-            )
+        if sticker_notes:
+            note_block = "\n".join(f"[表情包] {note}" for note in sticker_notes)
+            user_record = f"{user_record}\n{note_block}".strip() if user_record else note_block
+        if image_bytes:
+            marker = f"[图x{len(image_bytes)}]"
+            user_record = f"{user_record}\n{marker}".strip() if user_record else marker
+        known = set(self._stickers.known_ids()) if self._stickers else set()
+        segments = parse_reply_segments(reply, known_ids=known)
+        assistant_record = memory_text_for_segments(segments) or reply
         self._memory.append(message.session_id, "user", user_record)
-        self._memory.append(message.session_id, "assistant", reply)
-        bubbles = split_reply_bubbles(reply)
+        self._memory.append(message.session_id, "assistant", assistant_record)
         elapsed = time.monotonic() - turn_started
         _log.info(
-            "正在发送 mentioned=%s bubbles=%s elapsed=%.1fs preview=%r",
+            "正在发送 mentioned=%s segments=%s elapsed=%.1fs preview=%r",
             message.mentioned,
-            len(bubbles),
+            len(segments),
             elapsed,
             reply[:80],
         )
-        delivered = await self._replies.send_bubbles(message, bubbles, quote_first=quote_inbound)
+        delivered = await self._replies.send_segments(
+            message,
+            segments,
+            resolve_sticker=lambda sid: (
+                self._stickers.path_for(sid) if self._stickers else None
+            ),
+            quote_first=quote_inbound,
+        )
         if not delivered:
             _log.warning(
                 "reply not delivered t=%s msg_id=%s session=%s",
@@ -198,12 +243,13 @@ class ChatBot:
             )
             return
         _log.info(
-            "replied t=%s mentioned=%s bubbles=%s preview=%r",
+            "replied t=%s mentioned=%s segments=%s preview=%r",
             message.event_type,
             message.mentioned,
-            len(bubbles),
+            len(segments),
             reply[:80],
         )
+        reply = assistant_record
         now = time.time()
         self._gate.note_bot_reply(message.session_id, now)
         if message.is_group and not message.mentioned and not message.quotes_bot and message.group_openid:

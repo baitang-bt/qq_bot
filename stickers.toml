@@ -1,0 +1,8 @@
+# Local outbound stickers (PNG/JPG). Files live under data/stickers/ by default.
+# Model replies may embed [[sticker:id]] to send one.
+
+[[sticker]]
+id = "facepalm"
+file = "facepalm.png"
+tags = ["捂脸", "无奈"]
+description = "一只猫捂脸，无奈"

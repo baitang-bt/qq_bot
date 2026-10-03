@@ -388,8 +388,16 @@ def group_message_hint() -> str:
 def format_error(exc: BaseException) -> str:
     """Turn subprocess or IO errors into a short user-facing message."""
     if isinstance(exc, subprocess.CalledProcessError):
+        detail = ""
+        if isinstance(exc.stderr, str) and exc.stderr.strip():
+            detail = exc.stderr.strip()
+        elif isinstance(exc.stdout, str) and exc.stdout.strip():
+            detail = exc.stdout.strip()
+        if detail:
+            return f"脚本执行失败（退出码 {exc.returncode}）\n{detail[-800:]}"
         return f"脚本执行失败（退出码 {exc.returncode}）"
-    return str(exc) or exc.__class__.__name__
+    text = str(exc) or exc.__class__.__name__
+    return text[-1200:]
 
 
 def _string_list(value: object) -> list[str]:

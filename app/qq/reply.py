@@ -5,23 +5,33 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
+from collections.abc import Callable
+from pathlib import Path
 
 import httpx
 
 from app.config import Settings
 from app.qq import message_cache
 from app.qq.events import IncomingMessage
+from app.qq.media import MediaUploader
 from app.qq.token import TokenManager
+from app.stickers.markers import ReplySegment, StickerSeg, TextSeg
 
 _log = logging.getLogger(__name__)
 
 
 class ReplyClient:
-    """Post text (and C2C input-status) replies bound to an inbound msg_id."""
+    """Post text / rich-media replies bound to an inbound msg_id."""
 
-    def __init__(self, settings: Settings, tokens: TokenManager) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        tokens: TokenManager,
+        media: MediaUploader | None = None,
+    ) -> None:
         self._settings = settings
         self._tokens = tokens
+        self._media = media or MediaUploader(settings, tokens)
         self._seq: dict[str, int] = defaultdict(int)
 
     def next_seq(self, msg_id: str) -> int:
@@ -42,6 +52,38 @@ class ReplyClient:
             return False
         seq = self.next_seq(message.msg_id)
         return await self._post(message, build_text_payload(message, body, seq, quote=quote))
+
+    async def send_image(
+        self,
+        message: IncomingMessage,
+        path: Path,
+        *,
+        quote: bool = False,
+    ) -> bool:
+        """Upload a local PNG/JPG and send it as msg_type=7 rich media."""
+        try:
+            file_info = await self._media.upload_image(message, path)
+        except Exception:
+            _log.exception("send_image upload failed path=%s", path)
+            return False
+        seq = self.next_seq(message.msg_id)
+        payload: dict = {
+            "msg_type": 7,
+            "msg_id": message.msg_id,
+            "msg_seq": seq,
+            "media": {"file_info": file_info},
+        }
+        if quote:
+            quote_id = (message.quote_id or message.msg_id).strip()
+            if quote_id:
+                payload["message_reference"] = {
+                    "message_id": quote_id,
+                    "ignore_get_message_error": True,
+                }
+        ok = await self._post(message, payload)
+        if ok:
+            _log.info("sent image path=%s", path.name)
+        return ok
 
     async def send_bubbles(
         self,
@@ -77,6 +119,61 @@ class ReplyClient:
                 return delivered
         return delivered
 
+    async def send_segments(
+        self,
+        message: IncomingMessage,
+        segments: list[ReplySegment],
+        *,
+        resolve_sticker: Callable[[str], Path | None],
+        quote_first: bool = True,
+    ) -> bool:
+        """Send ordered text / sticker segments; resolve_sticker(id) -> Path | None."""
+        if not segments:
+            return False
+        delivered = False
+        first = True
+        for index, seg in enumerate(segments):
+            if index > 0:
+                await asyncio.sleep(0.5)
+            if isinstance(seg, TextSeg):
+                text = seg.text.strip()
+                if not text:
+                    continue
+                if index > 0 and not message.is_group:
+                    try:
+                        await self.send_c2c_typing(
+                            message,
+                            seconds=min(60, max(2, int(len(text) * 0.06) + 1)),
+                        )
+                    except Exception:
+                        _log.warning("typing before text segment failed", exc_info=True)
+                ok = await self.send_text(
+                    message,
+                    text,
+                    quote=(first and quote_first),
+                )
+                if ok:
+                    delivered = True
+                    first = False
+                else:
+                    return delivered
+            elif isinstance(seg, StickerSeg):
+                path = resolve_sticker(seg.sticker_id)
+                if path is None:
+                    _log.warning("sticker resolve failed id=%s", seg.sticker_id)
+                    continue
+                ok = await self.send_image(
+                    message,
+                    path,
+                    quote=(first and quote_first),
+                )
+                if ok:
+                    delivered = True
+                    first = False
+                else:
+                    _log.warning("sticker send failed id=%s", seg.sticker_id)
+        return delivered
+
     async def send_c2c_typing(self, message: IncomingMessage, seconds: int = 20) -> None:
         """Show a C2C 'typing' indicator. Group chats have no equivalent."""
         if message.is_group:
@@ -98,7 +195,7 @@ class ReplyClient:
             path = f"/v2/users/{message.user_openid}/messages"
         url = f"{self._settings.qq_api_base}{path}"
         headers = await self._tokens.auth_headers()
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(url, headers=headers, json=payload)
         if response.status_code >= 400:
             _log.warning(

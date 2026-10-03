@@ -9,7 +9,7 @@ group = true
 
 # 内容类型（语音走事件里的 asr_refer_text，没有官方单独 ASR HTTP）
 on_text = true
-on_image = false
+on_image = true
 on_voice = true
 
 # 同一会话：两次回复至少隔这么多秒；一分钟最多几条

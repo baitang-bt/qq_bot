@@ -7,7 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QEvent, Qt, QTimer
+from PyQt6.QtCore import QEvent, QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QGuiApplication, QIcon, QMouseEvent
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (
@@ -31,12 +31,33 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app.admin import bot_control, log_view, store, theme
+from app.admin import bot_control, env_settings, log_view, store, theme
 from app.admin.collapsible import CollapsibleSection
 
 
+class _BotPowerWorker(QObject):
+    """Run start/stop scripts off the UI thread so the window stays responsive."""
+
+    finished = pyqtSignal(object)
+
+    def __init__(self, action: str) -> None:
+        super().__init__()
+        self._action = action
+
+    def run(self) -> None:
+        """Execute store.start_bot or store.stop_bot and emit None or an exception."""
+        try:
+            if self._action == "start":
+                store.start_bot()
+            else:
+                store.stop_bot()
+            self.finished.emit(None)
+        except Exception as exc:  # noqa: BLE001 — surface any failure to the UI
+            self.finished.emit(exc)
+
+
 class AdminWindow(QMainWindow):
-    """Main window: bot control, persona, policy, and impressions."""
+    """Main window: bot control, API/.env, persona, policy, and impressions."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -46,6 +67,8 @@ class AdminWindow(QMainWindow):
         self._records: list[dict] = []
         self._admin_records: list[dict] = []
         self._log_clear_armed = False
+        self._power_thread: QThread | None = None
+        self._power_worker: _BotPowerWorker | None = None
         self._build_ui()
         self._wire_actions()
         self.refresh_all()
@@ -93,6 +116,7 @@ class AdminWindow(QMainWindow):
 
         tabs = QTabWidget()
         tabs.addTab(self._build_run_tab(), "运行")
+        tabs.addTab(self._build_api_tab(), "API")
         tabs.addTab(self._build_persona_tab(), "人设")
         tabs.addTab(self._build_policy_tab(), "回复策略")
         tabs.addTab(self._build_impressions_tab(), "印象")
@@ -148,6 +172,70 @@ class AdminWindow(QMainWindow):
         log_actions.addWidget(self._btn_log)
         log_actions.addWidget(self._btn_clear_log)
         layout.addLayout(log_actions)
+        return root
+
+    def _build_api_tab(self) -> QWidget:
+        """Edit project .env API / QQ credentials with secrets masked."""
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        hint = QLabel(
+            "写入项目根目录 .env（不进 git）。密钥框留空表示保持原值不改写；"
+            "保存后需在「运行」页重启机器人进程才会生效。"
+        )
+        hint.setWordWrap(True)
+        hint.setProperty("role", "muted")
+        layout.addWidget(hint)
+
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        self._api_qq_app_id = QLineEdit()
+        self._api_qq_app_id.setPlaceholderText("QQ 开放平台 AppID")
+        self._api_qq_secret = QLineEdit()
+        self._api_qq_secret.setEchoMode(QLineEdit.EchoMode.Password)
+        self._api_qq_secret.setPlaceholderText("已保存则留空不改")
+        self._api_qq_id = QLineEdit()
+        self._api_qq_id.setPlaceholderText("主人 QQ 号（可选）")
+
+        self._api_llm_base = QLineEdit()
+        self._api_llm_base.setPlaceholderText("例如 https://api.deepseek.com/v1")
+        self._api_llm_key = QLineEdit()
+        self._api_llm_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._api_llm_key.setPlaceholderText("已保存则留空不改")
+        self._api_llm_model = QLineEdit()
+        self._api_llm_model.setPlaceholderText("DeepSeek 官方 ID：deepseek-flash")
+        self._api_vision_model = QLineEdit()
+        self._api_vision_model.setPlaceholderText("可留空，默认跟 LLM（聊天已多模态识图）")
+        self._api_timeout = QLineEdit()
+        self._api_timeout.setPlaceholderText("秒，默认 25")
+
+        self._api_secret_hints: dict[str, QLabel] = {}
+        qq_secret_hint = QLabel("")
+        qq_secret_hint.setProperty("role", "muted")
+        llm_key_hint = QLabel("")
+        llm_key_hint.setProperty("role", "muted")
+        self._api_secret_hints["QQ_APP_SECRET"] = qq_secret_hint
+        self._api_secret_hints["LLM_API_KEY"] = llm_key_hint
+
+        form.addRow("QQ_APP_ID", self._api_qq_app_id)
+        form.addRow("QQ_APP_SECRET", self._api_qq_secret)
+        form.addRow("", qq_secret_hint)
+        form.addRow("QQ_ID", self._api_qq_id)
+        form.addRow("LLM_BASE_URL", self._api_llm_base)
+        form.addRow("LLM_API_KEY", self._api_llm_key)
+        form.addRow("", llm_key_hint)
+        form.addRow("LLM_MODEL", self._api_llm_model)
+        form.addRow("VISION_MODEL", self._api_vision_model)
+        form.addRow("LLM_TIMEOUT_SECONDS", self._api_timeout)
+        layout.addLayout(form)
+        layout.addStretch(1)
+
+        actions = QHBoxLayout()
+        self._btn_reload_api = QPushButton("重新加载")
+        self._btn_save_api = QPushButton("保存 API 配置")
+        actions.addWidget(self._btn_reload_api)
+        actions.addWidget(self._btn_save_api)
+        layout.addLayout(actions)
         return root
 
     def _build_persona_tab(self) -> QWidget:
@@ -287,6 +375,8 @@ class AdminWindow(QMainWindow):
         self._btn_refresh.clicked.connect(self.refresh_status)
         self._btn_log.clicked.connect(self.refresh_logs)
         self._btn_clear_log.clicked.connect(self.on_clear_logs)
+        self._btn_reload_api.clicked.connect(self.load_api_settings)
+        self._btn_save_api.clicked.connect(self.on_save_api_settings)
         self._btn_save_prompt.clicked.connect(self.on_save_prompt)
         self._btn_import_prompt.clicked.connect(self.on_import_prompt)
         self._btn_save_policy.clicked.connect(self.on_save_policy)
@@ -308,6 +398,7 @@ class AdminWindow(QMainWindow):
         """Reload every tab from disk."""
         self.refresh_status()
         self.refresh_logs()
+        self.load_api_settings()
         self.load_prompt()
         self.load_policy()
         self.load_impressions()
@@ -389,6 +480,59 @@ class AdminWindow(QMainWindow):
             self._alert("清空失败", store.format_error(exc), QMessageBox.Icon.Critical)
             return
         self.refresh_logs()
+
+    def load_api_settings(self) -> None:
+        """Fill API tab from .env; secrets stay empty with a masked status hint."""
+        try:
+            view = env_settings.read_api_settings()
+        except OSError as exc:
+            self._alert("读取 API 配置失败", store.format_error(exc), QMessageBox.Icon.Warning)
+            return
+        vals = view.values
+        self._api_qq_app_id.setText(vals.get("QQ_APP_ID", ""))
+        self._api_qq_id.setText(vals.get("QQ_ID", ""))
+        self._api_llm_base.setText(vals.get("LLM_BASE_URL", ""))
+        self._api_llm_model.setText(vals.get("LLM_MODEL", ""))
+        self._api_vision_model.setText(vals.get("VISION_MODEL", ""))
+        self._api_timeout.setText(vals.get("LLM_TIMEOUT_SECONDS", ""))
+        self._api_qq_secret.clear()
+        self._api_llm_key.clear()
+        self._set_secret_hint("QQ_APP_SECRET", view)
+        self._set_secret_hint("LLM_API_KEY", view)
+
+    def _set_secret_hint(self, key: str, view: env_settings.ApiSettingsView) -> None:
+        """Show masked status under a secret field without exposing the raw value."""
+        label = self._api_secret_hints[key]
+        if view.secret_set.get(key):
+            mask = view.secret_masks.get(key) or "****"
+            label.setText(f"已保存：{mask}（输入框留空则不修改）")
+        else:
+            label.setText("未配置")
+
+    def on_save_api_settings(self) -> None:
+        """Write public fields and any newly typed secrets into .env."""
+        updates = {
+            "QQ_APP_ID": self._api_qq_app_id.text(),
+            "QQ_ID": self._api_qq_id.text(),
+            "LLM_BASE_URL": self._api_llm_base.text(),
+            "LLM_MODEL": self._api_llm_model.text(),
+            "VISION_MODEL": self._api_vision_model.text(),
+            "LLM_TIMEOUT_SECONDS": self._api_timeout.text(),
+            "QQ_APP_SECRET": self._api_qq_secret.text(),
+            "LLM_API_KEY": self._api_llm_key.text(),
+        }
+        try:
+            path = env_settings.save_api_settings(updates)
+        except OSError as exc:
+            self._alert("保存失败", store.format_error(exc), QMessageBox.Icon.Critical)
+            return
+        self.load_api_settings()
+        self.refresh_status()
+        self._alert(
+            "已保存",
+            f"已写入 {path.name}。若机器人正在运行，请到「运行」页重启后生效。",
+            QMessageBox.Icon.Information,
+        )
 
     def _save_persona_section_state(self, _expanded: bool = False) -> None:
         """Persist anti_injection / stay_on_prompt fold state for the next launch."""
@@ -594,27 +738,58 @@ class AdminWindow(QMainWindow):
         self._alert("已保存", "管理员列表已更新，下一条 /bind 或指令即按新名单生效。", QMessageBox.Icon.Information)
 
     def on_start(self) -> None:
-        """Start the bot process."""
-        self._btn_toggle.setEnabled(False)
-        try:
-            store.start_bot()
-        except (OSError, subprocess.CalledProcessError) as exc:
-            self._alert("启动失败", store.format_error(exc), QMessageBox.Icon.Critical)
-            self.refresh_status()
-            return
-        self.refresh_status()
-        self.refresh_logs()
+        """Start the bot process in a background thread."""
+        self._run_power_action("start")
 
     def on_stop(self) -> None:
-        """Stop the bot process."""
-        self._btn_toggle.setEnabled(False)
-        try:
-            store.stop_bot()
-        except (OSError, subprocess.CalledProcessError) as exc:
-            self._alert("停止失败", store.format_error(exc), QMessageBox.Icon.Critical)
-            self.refresh_status()
+        """Stop the bot process in a background thread."""
+        self._run_power_action("stop")
+
+    def _run_power_action(self, action: str) -> None:
+        """Disable the power button and run start/stop off the UI thread."""
+        if self._power_thread is not None and self._power_thread.isRunning():
             return
+        self._btn_toggle.setEnabled(False)
+        self._btn_toggle.setText("启动中…" if action == "start" else "停止中…")
+        thread = QThread(self)
+        worker = _BotPowerWorker(action)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(
+            lambda err, a=action, t=thread, w=worker: self._on_power_finished(a, err, t, w)
+        )
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._power_thread = thread
+        self._power_worker = worker
+        thread.start()
+
+    def _on_power_finished(
+        self,
+        action: str,
+        error: object,
+        thread: QThread,
+        worker: _BotPowerWorker,
+    ) -> None:
+        """Re-enable controls after background start/stop completes."""
+        if self._power_thread is thread:
+            self._power_thread = None
+        if self._power_worker is worker:
+            self._power_worker = None
         self.refresh_status()
+        self.refresh_logs()
+        if error is not None:
+            title = "启动失败" if action == "start" else "停止失败"
+            self._alert(title, store.format_error(error), QMessageBox.Icon.Critical)
+            return
+        snap = store.bot_snapshot()
+        if action == "start" and not (snap.running and snap.healthy):
+            self._alert(
+                "启动未就绪",
+                "进程未通过健康检查。请查看「运行」页日志或 data/uvicorn.log。",
+                QMessageBox.Icon.Warning,
+            )
 
     def on_save_prompt(self) -> None:
         """Persist bot_prompt.json."""

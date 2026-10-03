@@ -62,7 +62,16 @@ def start_bot() -> dict[str, object]:
     """Run scripts/start-local.sh and return the new status."""
     if not _START.is_file():
         raise FileNotFoundError(str(_START))
-    subprocess.run(["/bin/bash", str(_START)], cwd=_ROOT, check=True)
+    result = subprocess.run(
+        ["/bin/bash", str(_START)],
+        cwd=_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip() or f"退出码 {result.returncode}"
+        raise RuntimeError(detail[-1200:])
     return bot_status()
 
 
@@ -70,5 +79,14 @@ def stop_bot() -> dict[str, object]:
     """Run scripts/stop-local.sh and return the new status."""
     if not _STOP.is_file():
         raise FileNotFoundError(str(_STOP))
-    subprocess.run(["/bin/bash", str(_STOP)], cwd=_ROOT, check=True)
+    result = subprocess.run(
+        ["/bin/bash", str(_STOP)],
+        cwd=_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip() or f"退出码 {result.returncode}"
+        raise RuntimeError(detail[-1200:])
     return bot_status()

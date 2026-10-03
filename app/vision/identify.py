@@ -1,73 +1,260 @@
-"""Download QQ attachments and describe them with a vision model."""
+"""Download images and resolve sticker descriptions via cache, library, or triage."""
 
 from __future__ import annotations
 
-import base64
 import io
 import logging
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, TypeAlias
 
 import httpx
 from PIL import Image
 
 from app.config import Settings
+from app.llm.client import StickerTriage
 from app.qq.events import Attachment
+from app.stickers.library import content_md5, normalize_sticker_id
 from app.vision.cache import ImageCache
-from app.vision.keys import keys_from_attachment, md5_key
+from app.vision.keys import is_sticker, keys_from_attachment, md5_key
+
+if TYPE_CHECKING:
+    from app.stickers.catalog import StickerCatalog
+    from app.stickers.library import StickerLibrary
 
 _log = logging.getLogger(__name__)
 
-_VISION_PROMPT = (
-    "用一两句中文说明这张图或表情包在表达什么。"
-    "如果有文字就读出来。不要猜测隐私信息。"
+DescribeFn: TypeAlias = Callable[[bytes, str], Awaitable[str]]
+TriageFn: TypeAlias = Callable[[bytes, str], Awaitable[StickerTriage]]
+LearnedFn: TypeAlias = Callable[[], None]
+
+# Failure strings that must never stay in image_cache.
+_BAD_CACHE_DESCRIPTIONS = frozenset(
+    {
+        "图没看清",
+        "没看清这张图",
+        "收到一张图（未配置视觉模型）",
+        "图里没什么能说的",
+    }
 )
+_MISS_NOTE = "图没看清"
 
 
 class ImageIdentifier:
-    """Resolve sticker/image descriptions with cache-first vision calls."""
+    """Fetch photo bytes for multimodal chat; resolve sticker notes via cache/describe."""
 
-    def __init__(self, settings: Settings, cache: ImageCache) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        cache: ImageCache | None = None,
+        describe: DescribeFn | None = None,
+        *,
+        triage: TriageFn | None = None,
+        library: StickerLibrary | None = None,
+        catalog: StickerCatalog | None = None,
+        auto_learn: bool | None = None,
+        on_learned: LearnedFn | None = None,
+    ) -> None:
         self._settings = settings
         self._cache = cache
+        self._describe = describe
+        self._triage = triage
+        self._library = library
+        self._catalog = catalog
+        self._auto_learn = (
+            settings.sticker_auto_learn if auto_learn is None else auto_learn
+        )
+        self._on_learned = on_learned
+        if self._cache is not None:
+            removed = self._cache.purge_descriptions(_BAD_CACHE_DESCRIPTIONS)
+            if removed:
+                _log.info("purged %s stale vision-cache rows", removed)
 
-    def peek_cached(self, attachments: tuple[Attachment, ...]) -> list[str] | None:
-        """Return descriptions if every image already has a pre-download cache hit."""
+    def set_describe(self, describe: DescribeFn) -> None:
+        """Attach the multimodal describe callback after LLMClient is constructed."""
+        self._describe = describe
+
+    def set_triage(self, triage: TriageFn) -> None:
+        """Attach the sticker describe+triage callback after LLMClient is constructed."""
+        self._triage = triage
+
+    @staticmethod
+    def partition(
+        attachments: tuple[Attachment, ...],
+    ) -> tuple[tuple[Attachment, ...], tuple[Attachment, ...]]:
+        """Split attachments into (stickers, photos)."""
+        stickers: list[Attachment] = []
+        photos: list[Attachment] = []
+        for item in attachments:
+            if is_sticker(item):
+                stickers.append(item)
+            else:
+                photos.append(item)
+        return tuple(stickers), tuple(photos)
+
+    async def fetch_images(
+        self,
+        attachments: tuple[Attachment, ...],
+    ) -> list[tuple[bytes, str]]:
+        """Download each image attachment; skip failures and return (bytes, mime) pairs."""
+        out: list[tuple[bytes, str]] = []
+        for attachment in attachments:
+            data, mime = await self._download(attachment)
+            if not data:
+                _log.warning(
+                    "image download empty filename=%s url=%s",
+                    attachment.filename,
+                    (attachment.url or "")[:120],
+                )
+                continue
+            out.append((data, mime))
+        return out
+
+    async def resolve_sticker_notes(
+        self,
+        attachments: tuple[Attachment, ...],
+    ) -> list[str]:
+        """Return sticker descriptions: cache/library hit skips vision; miss triages."""
         notes: list[str] = []
         for attachment in attachments:
-            keys = keys_from_attachment(attachment)
-            hit = self._cache.get(keys)
-            if not hit:
-                return None
-            notes.append(hit)
-        return notes if notes else []
-
-    async def describe_all(self, attachments: tuple[Attachment, ...]) -> list[str]:
-        """Describe each image, using cache whenever a key matches."""
-        notes: list[str] = []
-        for attachment in attachments:
-            notes.append(await self._describe_one(attachment))
+            note = await self._resolve_one_sticker(attachment)
+            if note:
+                notes.append(note)
         return notes
 
-    async def _describe_one(self, attachment: Attachment) -> str:
-        """Cache lookup, then download + vision, then store all keys."""
+    async def _resolve_one_sticker(self, attachment: Attachment) -> str:
+        """Resolve one sticker: library/catalog → image_cache → triage → optional learn."""
         keys = keys_from_attachment(attachment)
-        hit = self._cache.get(keys)
-        if hit:
-            _log.info("image_cache hit keys=%s", keys)
-            return hit
+        if self._cache is not None and keys:
+            cached = self._cache.get(keys)
+            if cached:
+                _log.info("sticker cache hit keys=%s", keys[:2])
+                return cached
+
         data, mime = await self._download(attachment)
         if not data:
-            return "没看清这张图"
-        keys = list(dict.fromkeys([*keys, md5_key(data)]))
-        hit = self._cache.get(keys)
-        if hit:
-            _log.info("image_cache md5 hit keys=%s", keys)
-            self._cache.put(keys, hit, source="md5-hit")
-            return hit
-        _log.info("vision call keys=%s bytes=%s", keys, len(data))
-        description = await self._vision(data, mime)
-        self._cache.put(keys, description, source="vision")
-        return description
+            _log.warning(
+                "sticker download empty filename=%s url=%s",
+                attachment.filename,
+                (attachment.url or "")[:120],
+            )
+            return _MISS_NOTE
+
+        digest = content_md5(data)
+        local_desc = self._local_description(digest)
+        if local_desc:
+            all_keys = self._merge_keys(keys, data)
+            if self._cache is not None:
+                self._cache.put(all_keys, local_desc, source="library")
+            _log.info(
+                "sticker library/catalog hit md5=%s chars=%s",
+                digest[:10],
+                len(local_desc),
+            )
+            return local_desc
+
+        all_keys = self._merge_keys(keys, data)
+        if self._cache is not None:
+            cached = self._cache.get(all_keys)
+            if cached:
+                _log.info("sticker cache hit after download keys=%s", all_keys[:2])
+                self._cache.put(all_keys, cached, source="backfill")
+                return cached
+
+        triage = await self._run_triage(data, mime)
+        desc = (triage.description or "").strip()
+        if not desc or desc in _BAD_CACHE_DESCRIPTIONS:
+            return desc or _MISS_NOTE
+
+        if self._cache is not None and all_keys:
+            self._cache.put(all_keys, desc, source="vision")
+            _log.info("sticker cache put keys=%s chars=%s", all_keys[:2], len(desc))
+
+        if (
+            self._auto_learn
+            and triage.save
+            and self._library is not None
+            and not self._library.has_md5(digest)
+        ):
+            self._try_learn(data, mime, digest, triage, desc)
+
+        return desc
+
+    def _local_description(self, digest: str) -> str:
+        """Return a description from catalog or library for this content md5."""
+        if self._catalog is not None:
+            desc = self._catalog.description_for_md5(digest)
+            if desc:
+                return desc
+        if self._library is not None:
+            desc = self._library.description_for_md5(digest)
+            if desc:
+                return desc
+        return ""
+
+    def _merge_keys(self, keys: list[str], data: bytes) -> list[str]:
+        """Combine pre-download keys with the content md5 key."""
+        all_keys = list(keys)
+        content_key = md5_key(data)
+        if content_key not in all_keys:
+            all_keys.append(content_key)
+        return all_keys
+
+    async def _run_triage(self, data: bytes, mime: str) -> StickerTriage:
+        """Run describe+triage, falling back to describe-only when triage is unset."""
+        if self._triage is not None:
+            _log.info("sticker cache miss; multimodal triage")
+            try:
+                return await self._triage(data, mime)
+            except Exception:
+                _log.exception("sticker triage failed")
+                return StickerTriage(description="", save=False, reason="triage_error")
+        if self._describe is None:
+            _log.warning("sticker describe callback missing")
+            return StickerTriage(description="", save=False, reason="no_callback")
+        _log.info("sticker cache miss; multimodal describe keys")
+        try:
+            desc = (await self._describe(data, mime)).strip()
+        except Exception:
+            _log.exception("sticker describe failed")
+            return StickerTriage(description="", save=False, reason="describe_error")
+        return StickerTriage(description=desc, save=False, reason="describe_only")
+
+    def _try_learn(
+        self,
+        data: bytes,
+        mime: str,
+        digest: str,
+        triage: StickerTriage,
+        description: str,
+    ) -> None:
+        """Persist a worthwhile sticker to the local library and dual-write cache keys."""
+        assert self._library is not None
+        sticker_id = normalize_sticker_id(triage.sticker_id, digest)
+        entry = self._library.save_sticker(
+            data,
+            mime,
+            sticker_id=sticker_id,
+            description=description,
+            tags=triage.tags,
+        )
+        if entry is None:
+            return
+        extra_keys = [f"md5:{entry.md5}", f"sticker:{entry.id}"]
+        if self._cache is not None:
+            self._cache.put(extra_keys, entry.description, source="learned")
+        if self._catalog is not None:
+            self._catalog.invalidate()
+        if self._on_learned is not None:
+            try:
+                self._on_learned()
+            except Exception:
+                _log.exception("sticker on_learned callback failed")
+        _log.info(
+            "sticker auto-learned id=%s md5=%s reason=%s",
+            entry.id,
+            entry.md5[:10],
+            triage.reason or "-",
+        )
 
     async def _download(self, attachment: Attachment) -> tuple[bytes, str]:
         """Fetch attachment bytes and normalize GIF/webp to a JPEG first frame."""
@@ -91,52 +278,6 @@ class ImageIdentifier:
         if mime not in {"image/jpeg", "image/png", "image/jpg"}:
             data, mime = _first_frame_jpeg(data)
         return data, mime
-
-    async def _vision(self, data: bytes, mime: str) -> str:
-        """Call the OpenAI-compatible vision chat API with a data URL."""
-        if not self._settings.llm_api_key:
-            return "收到一张图（未配置视觉模型）"
-        b64 = base64.b64encode(data).decode("ascii")
-        data_url = f"data:{mime};base64,{b64}"
-        url = f"{self._settings.llm_base_url}/chat/completions"
-        payload: dict[str, Any] = {
-            "model": self._settings.vision_model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": _VISION_PROMPT},
-                        {"type": "image_url", "image_url": {"url": data_url}},
-                    ],
-                }
-            ],
-            "max_tokens": 200,
-            "temperature": 0.2,
-        }
-        headers = {
-            "Authorization": f"Bearer {self._settings.llm_api_key}",
-            "Content-Type": "application/json",
-        }
-        try:
-            async with httpx.AsyncClient(
-                timeout=self._settings.vision_timeout_seconds
-            ) as client:
-                response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            text = str(response.json()["choices"][0]["message"]["content"]).strip()
-            return text or "图里没什么能说的"
-        except httpx.HTTPStatusError as exc:
-            body = exc.response.text[:500]
-            _log.error(
-                "vision call failed model=%s status=%s body=%s",
-                self._settings.vision_model,
-                exc.response.status_code,
-                body,
-            )
-            return "图没看清"
-        except Exception:
-            _log.exception("vision call failed")
-            return "图没看清"
 
 
 def _first_frame_jpeg(data: bytes) -> tuple[bytes, str]:

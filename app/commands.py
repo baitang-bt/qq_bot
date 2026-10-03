@@ -16,6 +16,7 @@ _IMPRESSION = re.compile(
     re.IGNORECASE,
 )
 _BIND = re.compile(r"^/bind(?:\s+|　+)(.*)$", re.IGNORECASE)
+_STICKER = re.compile(r"^/(?:贴纸|sticker)(?:\s+|　+)(.+)$", re.IGNORECASE)
 _DENIED = (
     "这条指令只认管理员 QQ。"
     "官方群消息里没有 QQ 号，请先私聊发送：/bind 你的QQ号"
@@ -29,6 +30,19 @@ class CommandRouter:
         self._owner = owner
         self._impressions = impressions
 
+    def try_sticker_send(self, message: IncomingMessage) -> str | None:
+        """Return a sticker id for /贴纸|/sticker, or None if not that command."""
+        if message.is_group and not message.mentioned:
+            return None
+        text = _slash_text(message)
+        match = _STICKER.match(text)
+        if not match:
+            return None
+        if not self._owner.allows(message, self._impressions):
+            return None
+        sticker_id = match.group(1).strip().lower()
+        return sticker_id or None
+
     def try_handle(self, message: IncomingMessage) -> str | None:
         """Return a command reply, or None if this is not a directed slash command."""
         if message.is_group and not message.mentioned:
@@ -36,6 +50,11 @@ class CommandRouter:
         text = _slash_text(message)
         if not text.startswith("/"):
             return None
+        if _STICKER.match(text):
+            # Owner-denied sticker attempts still need a text reply.
+            if not self._owner.allows(message, self._impressions):
+                return _DENIED
+            return "用法：/贴纸 facepalm（需 stickers.toml 里已配置）"
         bind = _BIND.match(text)
         if bind:
             return self._owner.bind_claimed_qq(message, bind.group(1).strip())
@@ -44,7 +63,7 @@ class CommandRouter:
         match = _IMPRESSION.match(text)
         if match:
             return self._impression(match.group(1).strip())
-        return "还不认识这条指令。现在可以用：/bind QQ号，/impression 昵称"
+        return "还不认识这条指令。现在可以用：/bind QQ号，/impression 昵称，/贴纸 id"
 
     def _impression(self, username: str) -> str:
         """Dump the stored impression prompt for a username."""
