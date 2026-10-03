@@ -12,10 +12,12 @@ from PyQt6.QtGui import QAction, QCloseEvent, QGuiApplication, QIcon, QMouseEven
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -32,7 +34,6 @@ from PyQt6.QtWidgets import (
 )
 
 from app.admin import bot_control, env_settings, log_view, store, theme
-from app.admin.collapsible import CollapsibleSection
 
 
 class _BotPowerWorker(QObject):
@@ -57,7 +58,7 @@ class _BotPowerWorker(QObject):
 
 
 class AdminWindow(QMainWindow):
-    """Main window: bot control, API/.env, persona, policy, and impressions."""
+    """Main window: run control, Bot 功能, API/.env, persona, policy, and impressions."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -67,6 +68,10 @@ class AdminWindow(QMainWindow):
         self._records: list[dict] = []
         self._admin_records: list[dict] = []
         self._log_clear_armed = False
+        self._persona_id = ""
+        self._persona_file = ""
+        self._persona_dirty = False
+        self._persona_loading = False
         self._power_thread: QThread | None = None
         self._power_worker: _BotPowerWorker | None = None
         self._build_ui()
@@ -116,6 +121,7 @@ class AdminWindow(QMainWindow):
 
         tabs = QTabWidget()
         tabs.addTab(self._build_run_tab(), "运行")
+        tabs.addTab(self._build_features_tab(), "Bot 功能")
         tabs.addTab(self._build_api_tab(), "API")
         tabs.addTab(self._build_persona_tab(), "人设")
         tabs.addTab(self._build_policy_tab(), "回复策略")
@@ -149,7 +155,7 @@ class AdminWindow(QMainWindow):
         self._monitor_label.setProperty("role", "accent")
         layout.addWidget(self._monitor_label)
 
-        hint = QLabel("人设与 reply_policy 保存后下一条消息即生效，一般不必重启。")
+        hint = QLabel("人设与 reply_policy 保存后下一条消息即生效。改代码或表情发送异常时，先点停止再启动。")
         hint.setWordWrap(True)
         hint.setProperty("role", "muted")
         layout.addWidget(hint)
@@ -172,6 +178,38 @@ class AdminWindow(QMainWindow):
         log_actions.addWidget(self._btn_log)
         log_actions.addWidget(self._btn_clear_log)
         layout.addLayout(log_actions)
+        return root
+
+    def _build_features_tab(self) -> QWidget:
+        """Speak-mode switch and Finder shortcuts for bot data folders."""
+        root = QWidget()
+        layout = QVBoxLayout(root)
+        speak = QGroupBox("群发言")
+        feat = QVBoxLayout(speak)
+        self._btn_speak = QPushButton("发言模式：自动")
+        self._btn_speak.setToolTip(
+            "点击切换群发言：自动（未@规则+工作日高峰）→ 全部尝试回复 → 仅@和引用回复"
+        )
+        feat.addWidget(self._btn_speak)
+        feat_hint = QLabel("写入 reply_policy.toml，下一条消息生效，不必重启。")
+        feat_hint.setWordWrap(True)
+        feat_hint.setProperty("role", "muted")
+        feat.addWidget(feat_hint)
+        layout.addWidget(speak)
+
+        files = QGroupBox("本地文件")
+        file_row = QHBoxLayout(files)
+        self._btn_stickers = QPushButton("打开表情包")
+        self._btn_stickers.setToolTip("访达打开 data/stickers（PNG/JPG/GIF）")
+        self._btn_personas_folder = QPushButton("打开人设")
+        self._btn_personas_folder.setToolTip("访达打开 data/personas（每套人设一个文件夹）")
+        self._btn_project_folder = QPushButton("打开项目根")
+        self._btn_project_folder.setToolTip("访达打开仓库根目录（personas.toml、.env、reply_policy.toml）")
+        file_row.addWidget(self._btn_stickers)
+        file_row.addWidget(self._btn_personas_folder)
+        file_row.addWidget(self._btn_project_folder)
+        layout.addWidget(files)
+        layout.addStretch(1)
         return root
 
     def _build_api_tab(self) -> QWidget:
@@ -239,37 +277,50 @@ class AdminWindow(QMainWindow):
         return root
 
     def _build_persona_tab(self) -> QWidget:
-        """bot_prompt.json editor."""
+        """Persona pack list plus one txt editor."""
         root = QWidget()
-        layout = QVBoxLayout(root)
-        layout.addWidget(QLabel("persona（整体人设）"))
-        self._persona = QPlainTextEdit()
-        layout.addWidget(self._persona, stretch=1)
-        ui = store.read_admin_ui()
-        self._anti = QPlainTextEdit()
-        self._anti_section = CollapsibleSection(
-            "anti_injection（每行一条）",
-            self._anti,
-            expanded=ui.persona_anti_injection_expanded,
-            content_min_height=100,
-        )
-        layout.addWidget(self._anti_section)
-        self._stay = QPlainTextEdit()
-        self._stay_section = CollapsibleSection(
-            "stay_on_prompt（每行一条）",
-            self._stay,
-            expanded=ui.persona_stay_on_prompt_expanded,
-            content_min_height=120,
-        )
-        layout.addWidget(self._stay_section)
-        self._anti_section.toggled.connect(self._save_persona_section_state)
-        self._stay_section.toggled.connect(self._save_persona_section_state)
-        prompt_actions = QHBoxLayout()
-        self._btn_save_prompt = QPushButton("保存人设")
-        self._btn_import_prompt = QPushButton("导入人设")
-        prompt_actions.addWidget(self._btn_save_prompt)
-        prompt_actions.addWidget(self._btn_import_prompt)
-        layout.addLayout(prompt_actions)
+        split = QSplitter(Qt.Orientation.Horizontal)
+
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        hint = QLabel("点选只用来编辑。线上口吻以「启用」的那一套为准，下一条消息生效。")
+        hint.setWordWrap(True)
+        hint.setProperty("role", "muted")
+        left_layout.addWidget(hint)
+        self._persona_list = QListWidget()
+        left_layout.addWidget(self._persona_list)
+        pack_actions = QHBoxLayout()
+        self._btn_new_persona = QPushButton("新建")
+        self._btn_enable_persona = QPushButton("启用")
+        self._btn_delete_persona = QPushButton("删除")
+        pack_actions.addWidget(self._btn_new_persona)
+        pack_actions.addWidget(self._btn_enable_persona)
+        pack_actions.addWidget(self._btn_delete_persona)
+        left_layout.addLayout(pack_actions)
+        split.addWidget(left)
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        file_row = QHBoxLayout()
+        file_row.addWidget(QLabel("文件"))
+        self._persona_file_combo = QComboBox()
+        file_row.addWidget(self._persona_file_combo, stretch=1)
+        self._btn_add_persona_file = QPushButton("+ txt")
+        self._btn_open_persona_pack = QPushButton("打开本组")
+        file_row.addWidget(self._btn_add_persona_file)
+        file_row.addWidget(self._btn_open_persona_pack)
+        right_layout.addLayout(file_row)
+        self._persona_editor = QPlainTextEdit()
+        self._persona_editor.setPlaceholderText("选中人设和文件后编辑…")
+        right_layout.addWidget(self._persona_editor, stretch=1)
+        self._btn_save_persona_file = QPushButton("保存本文件")
+        right_layout.addWidget(self._btn_save_persona_file)
+        split.addWidget(right)
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 2)
+
+        outer = QVBoxLayout(root)
+        outer.addWidget(split)
         return root
 
     def _build_policy_tab(self) -> QWidget:
@@ -373,12 +424,23 @@ class AdminWindow(QMainWindow):
         """Connect buttons and list selection."""
         self._btn_toggle.clicked.connect(self.on_toggle_power)
         self._btn_refresh.clicked.connect(self.refresh_status)
+        self._btn_stickers.clicked.connect(self.on_open_stickers)
+        self._btn_personas_folder.clicked.connect(self.on_open_personas_folder)
+        self._btn_project_folder.clicked.connect(self.on_open_project_folder)
+        self._btn_speak.clicked.connect(self.on_cycle_speak_mode)
         self._btn_log.clicked.connect(self.refresh_logs)
         self._btn_clear_log.clicked.connect(self.on_clear_logs)
         self._btn_reload_api.clicked.connect(self.load_api_settings)
         self._btn_save_api.clicked.connect(self.on_save_api_settings)
-        self._btn_save_prompt.clicked.connect(self.on_save_prompt)
-        self._btn_import_prompt.clicked.connect(self.on_import_prompt)
+        self._btn_new_persona.clicked.connect(self.on_new_persona)
+        self._btn_enable_persona.clicked.connect(self.on_enable_persona)
+        self._btn_delete_persona.clicked.connect(self.on_delete_persona)
+        self._btn_add_persona_file.clicked.connect(self.on_add_persona_file)
+        self._btn_open_persona_pack.clicked.connect(self.on_open_persona_pack)
+        self._btn_save_persona_file.clicked.connect(self.on_save_persona_file)
+        self._persona_list.currentItemChanged.connect(self.on_persona_selected)
+        self._persona_file_combo.currentTextChanged.connect(self.on_persona_file_changed)
+        self._persona_editor.textChanged.connect(self.on_persona_text_changed)
         self._btn_save_policy.clicked.connect(self.on_save_policy)
         self._btn_save_imp.clicked.connect(self.on_save_impression)
         self._btn_new_imp.clicked.connect(self.on_new_impression)
@@ -399,7 +461,7 @@ class AdminWindow(QMainWindow):
         self.refresh_status()
         self.refresh_logs()
         self.load_api_settings()
-        self.load_prompt()
+        self.load_personas()
         self.load_policy()
         self.load_impressions()
         self.load_command_admins()
@@ -428,6 +490,7 @@ class AdminWindow(QMainWindow):
         monitor = store.gateway_status_line()
         self._monitor_label.setText(monitor)
         self._monitor_label.setVisible(bool(monitor))
+        self._refresh_speak_mode_button()
 
     def _update_toggle_button(self, running: bool) -> None:
         """Show 启动 or 停止 on the single power button."""
@@ -480,6 +543,50 @@ class AdminWindow(QMainWindow):
             self._alert("清空失败", store.format_error(exc), QMessageBox.Icon.Critical)
             return
         self.refresh_logs()
+
+    def on_open_stickers(self) -> None:
+        """Reveal the local sticker cache folder in Finder."""
+        try:
+            path = store.reveal_in_file_manager(store.stickers_cache_dir())
+        except (OSError, subprocess.CalledProcessError) as exc:
+            self._alert("无法打开表情包文件夹", store.format_error(exc), QMessageBox.Icon.Warning)
+            return
+        self._btn_stickers.setToolTip(f"访达打开 {path}")
+
+    def on_open_personas_folder(self) -> None:
+        """Reveal data/personas in Finder."""
+        try:
+            path = store.reveal_in_file_manager(store.personas_dir())
+        except (OSError, subprocess.CalledProcessError) as exc:
+            self._alert("无法打开人设文件夹", store.format_error(exc), QMessageBox.Icon.Warning)
+            return
+        self._btn_personas_folder.setToolTip(f"访达打开 {path}")
+
+    def on_open_project_folder(self) -> None:
+        """Reveal the repository root in Finder."""
+        try:
+            path = store.reveal_in_file_manager(bot_control.project_root())
+        except (OSError, subprocess.CalledProcessError) as exc:
+            self._alert("无法打开项目根目录", store.format_error(exc), QMessageBox.Icon.Warning)
+            return
+        self._btn_project_folder.setToolTip(f"访达打开 {path}")
+
+    def _refresh_speak_mode_button(self) -> None:
+        """Show the current group speak mode on the cycle button."""
+        try:
+            self._btn_speak.setText(store.speak_mode_button_text())
+        except OSError:
+            self._btn_speak.setText("发言模式：自动")
+
+    def on_cycle_speak_mode(self) -> None:
+        """Cycle auto / all / mention-quote and persist speak_mode in toml."""
+        try:
+            mode = store.cycle_speak_mode()
+        except OSError as exc:
+            self._alert("无法切换发言模式", store.format_error(exc), QMessageBox.Icon.Warning)
+            return
+        self._btn_speak.setText(store.speak_mode_button_text(mode))
+        self.load_policy()
 
     def load_api_settings(self) -> None:
         """Fill API tab from .env; secrets stay empty with a masked status hint."""
@@ -534,30 +641,213 @@ class AdminWindow(QMainWindow):
             QMessageBox.Icon.Information,
         )
 
-    def _save_persona_section_state(self, _expanded: bool = False) -> None:
-        """Persist anti_injection / stay_on_prompt fold state for the next launch."""
-        store.save_admin_ui(
-            store.AdminUiState(
-                persona_anti_injection_expanded=self._anti_section.is_expanded,
-                persona_stay_on_prompt_expanded=self._stay_section.is_expanded,
-            )
-        )
-
-    def load_prompt(self) -> None:
-        """Fill persona tab from bot_prompt.json."""
+    def load_personas(self) -> None:
+        """Reload the persona pack list and keep the current selection when possible."""
         try:
-            data = store.read_prompt()
+            packs = store.list_persona_packs()
         except (OSError, ValueError) as exc:
             self._alert("读取人设失败", store.format_error(exc), QMessageBox.Icon.Warning)
             return
-        self._persona.setPlainText(data.persona)
-        self._anti.setPlainText("\n".join(data.anti_injection))
-        self._stay.setPlainText("\n".join(data.stay_on_prompt))
+        keep_id = self._persona_id
+        active = ""
+        self._persona_list.blockSignals(True)
+        self._persona_list.clear()
+        selected: QListWidgetItem | None = None
+        for pack in packs:
+            pack_id = str(pack.get("id") or "")
+            title = str(pack.get("title") or pack_id)
+            suffix = " · 启用" if pack.get("active") else ""
+            item = QListWidgetItem(f"{title}{suffix}\n{pack_id}")
+            item.setData(Qt.ItemDataRole.UserRole, pack_id)
+            self._persona_list.addItem(item)
+            if pack.get("active"):
+                active = pack_id
+            if keep_id and pack_id == keep_id:
+                selected = item
+            elif selected is None and pack.get("active"):
+                selected = item
+        if selected is None and self._persona_list.count():
+            selected = self._persona_list.item(0)
+        self._persona_list.blockSignals(False)
+        if selected is not None:
+            self._persona_list.setCurrentItem(selected)
+        elif not packs:
+            self._persona_id = ""
+            self._persona_file = ""
+            self._persona_file_combo.clear()
+            self._persona_editor.setPlainText("")
+        if not keep_id and active:
+            self._persona_id = active
+
+    def on_persona_selected(
+        self, current: QListWidgetItem | None, _previous: QListWidgetItem | None
+    ) -> None:
+        """Load txt files for the pack selected in the list (does not enable it)."""
+        if current is None:
+            return
+        self._flush_persona_editor()
+        pack_id = str(current.data(Qt.ItemDataRole.UserRole) or "")
+        self._persona_id = pack_id
+        self._fill_persona_files(pack_id)
+
+    def _fill_persona_files(self, pack_id: str, prefer: str = "") -> None:
+        """Populate the file combo for a pack and load one txt."""
+        names = store.list_persona_files(pack_id) if pack_id else []
+        want = prefer or self._persona_file
+        if want not in names:
+            want = names[0] if names else ""
+        self._persona_file_combo.blockSignals(True)
+        self._persona_file_combo.clear()
+        self._persona_file_combo.addItems(names)
+        if want:
+            self._persona_file_combo.setCurrentText(want)
+        self._persona_file_combo.blockSignals(False)
+        self._load_persona_file(pack_id, want)
+
+    def _load_persona_file(self, pack_id: str, filename: str) -> None:
+        """Put one txt into the editor without marking it dirty."""
+        self._persona_loading = True
+        self._persona_file = filename
+        if pack_id and filename:
+            self._persona_editor.setPlainText(store.read_persona_file(pack_id, filename))
+        else:
+            self._persona_editor.setPlainText("")
+        self._persona_dirty = False
+        self._persona_loading = False
+
+    def on_persona_file_changed(self, filename: str) -> None:
+        """Switch the editor to another txt in the current pack."""
+        if self._persona_loading:
+            return
+        self._flush_persona_editor()
+        self._load_persona_file(self._persona_id, filename.strip())
+
+    def on_persona_text_changed(self) -> None:
+        """Remember that the current txt has unsaved edits."""
+        if not self._persona_loading:
+            self._persona_dirty = True
+
+    def _flush_persona_editor(self) -> None:
+        """Write the current editor buffer if it changed."""
+        if not self._persona_dirty or not self._persona_id or not self._persona_file:
+            return
+        try:
+            store.save_persona_file(
+                self._persona_id,
+                self._persona_file,
+                self._persona_editor.toPlainText(),
+            )
+        except (OSError, ValueError) as exc:
+            self._alert("保存人设文件失败", str(exc) or store.format_error(exc), QMessageBox.Icon.Warning)
+            return
+        self._persona_dirty = False
+
+    def on_save_persona_file(self) -> None:
+        """Persist the txt currently in the editor."""
+        if not self._persona_id or not self._persona_file:
+            self._alert("未选中文件", "先在左侧选一套人设，再选一个 txt。", QMessageBox.Icon.Warning)
+            return
+        try:
+            path = store.save_persona_file(
+                self._persona_id,
+                self._persona_file,
+                self._persona_editor.toPlainText(),
+            )
+        except (OSError, ValueError) as exc:
+            self._alert("保存失败", str(exc) or store.format_error(exc), QMessageBox.Icon.Critical)
+            return
+        self._persona_dirty = False
+        self._alert("已保存", f"已写入\n{path}", QMessageBox.Icon.Information)
+
+    def on_new_persona(self) -> None:
+        """Create a new pack folder with an empty persona.txt."""
+        persona_id, ok = QInputDialog.getText(self, "新建人设", "id（小写字母、数字、下划线）：")
+        if not ok:
+            return
+        try:
+            row = store.new_persona_pack(persona_id.strip())
+        except (OSError, ValueError) as exc:
+            self._alert("无法新建", str(exc) or store.format_error(exc), QMessageBox.Icon.Warning)
+            return
+        self._persona_id = str(row.get("id") or "")
+        self.load_personas()
+
+    def on_enable_persona(self) -> None:
+        """Make the selected pack the one the bot uses."""
+        pack_id = self._persona_id
+        if not pack_id:
+            self._alert("未选中人设", "先在左侧选一套再启用。", QMessageBox.Icon.Warning)
+            return
+        self._flush_persona_editor()
+        try:
+            store.set_persona_active(pack_id)
+        except (OSError, ValueError) as exc:
+            self._alert("无法启用", str(exc) or store.format_error(exc), QMessageBox.Icon.Warning)
+            return
+        self.load_personas()
+
+    def on_delete_persona(self) -> None:
+        """Delete the selected pack if it is not active and not the last one."""
+        pack_id = self._persona_id
+        if not pack_id:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "删除人设",
+            f"删除 {pack_id} 及其全部 txt？启用中的不能删。",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            store.delete_persona_pack(pack_id)
+        except (OSError, ValueError) as exc:
+            self._alert("无法删除", str(exc) or store.format_error(exc), QMessageBox.Icon.Warning)
+            return
+        self._persona_id = ""
+        self._persona_file = ""
+        self.load_personas()
+
+    def on_add_persona_file(self) -> None:
+        """Add an empty txt to the selected pack."""
+        if not self._persona_id:
+            self._alert("未选中人设", "先在左侧选一套人设。", QMessageBox.Icon.Warning)
+            return
+        name, ok = QInputDialog.getText(self, "新建 txt", "文件名（如 extra_lore.txt）：")
+        if not ok:
+            return
+        try:
+            path = store.add_persona_file(self._persona_id, name.strip())
+        except (OSError, ValueError) as exc:
+            self._alert("无法添加文件", str(exc) or store.format_error(exc), QMessageBox.Icon.Warning)
+            return
+        self._fill_persona_files(self._persona_id, prefer=path.name)
+
+    def on_open_persona_pack(self) -> None:
+        """Reveal the selected pack folder in Finder."""
+        if not self._persona_id:
+            self._alert("未选中人设", "先在左侧选一套人设。", QMessageBox.Icon.Warning)
+            return
+        folder = store.personas_dir() / self._persona_id
+        try:
+            path = store.reveal_in_file_manager(folder)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            self._alert("无法打开本组", store.format_error(exc), QMessageBox.Icon.Warning)
+            return
+        self._btn_open_persona_pack.setToolTip(f"访达打开 {path}")
 
     def load_policy(self) -> None:
         """Fill policy tab from reply_policy.toml."""
         text, _path = store.read_reply_policy()
         self._policy.setPlainText(text)
+
+    def on_save_policy(self) -> None:
+        """Persist reply_policy.toml."""
+        try:
+            path = store.save_reply_policy(self._policy.toPlainText())
+        except OSError as exc:
+            self._alert("保存失败", store.format_error(exc), QMessageBox.Icon.Critical)
+            return
+        self._alert("已保存", f"策略已写入\n{path}", QMessageBox.Icon.Information)
 
     def load_impressions(self) -> None:
         """Reload impression list."""
@@ -790,46 +1080,6 @@ class AdminWindow(QMainWindow):
                 "进程未通过健康检查。请查看「运行」页日志或 data/uvicorn.log。",
                 QMessageBox.Icon.Warning,
             )
-
-    def on_save_prompt(self) -> None:
-        """Persist bot_prompt.json."""
-        try:
-            path = store.save_prompt(
-                self._persona.toPlainText(),
-                self._anti.toPlainText().splitlines(),
-                self._stay.toPlainText().splitlines(),
-            )
-        except OSError as exc:
-            self._alert("保存失败", store.format_error(exc), QMessageBox.Icon.Critical)
-            return
-        self._alert("已保存", f"人设已写入\n{path}", QMessageBox.Icon.Information)
-
-    def on_import_prompt(self) -> None:
-        """Import bot_prompt.json from a local file."""
-        path, _filter = QFileDialog.getOpenFileName(
-            self,
-            "导入人设",
-            "",
-            "JSON 文件 (*.json);;所有文件 (*)",
-        )
-        if not path:
-            return
-        try:
-            saved = store.import_prompt_file(Path(path))
-        except (OSError, ValueError) as exc:
-            self._alert("导入失败", str(exc) or store.format_error(exc), QMessageBox.Icon.Critical)
-            return
-        self.load_prompt()
-        self._alert("导入完成", f"人设已写入\n{saved}", QMessageBox.Icon.Information)
-
-    def on_save_policy(self) -> None:
-        """Persist reply_policy.toml."""
-        try:
-            path = store.save_reply_policy(self._policy.toPlainText())
-        except OSError as exc:
-            self._alert("保存失败", store.format_error(exc), QMessageBox.Icon.Critical)
-            return
-        self._alert("已保存", f"策略已写入\n{path}", QMessageBox.Icon.Information)
 
     def on_save_impression(self) -> None:
         """Persist the selected or newly entered impression."""

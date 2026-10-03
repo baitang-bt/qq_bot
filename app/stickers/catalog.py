@@ -1,4 +1,4 @@
-"""Load stickers.toml and resolve sticker ids to local PNG/JPG paths."""
+"""Load stickers.toml and resolve sticker ids to local PNG/JPG/GIF paths."""
 
 from __future__ import annotations
 
@@ -7,14 +7,16 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.stickers.library import content_md5, normalize_sticker_id, truncate_description
+
 _log = logging.getLogger(__name__)
 
-_ALLOWED_SUFFIXES = frozenset({".png", ".jpg", ".jpeg"})
+_ALLOWED_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
 
 
 @dataclass(frozen=True)
 class StickerEntry:
-    """One outbound sticker listed in stickers.toml."""
+    """One outbound sticker listed in stickers.toml or found in the stickers folder."""
 
     id: str
     path: Path
@@ -31,12 +33,14 @@ class StickerCatalog:
         self._index_path = index_path
         self._stickers_dir = stickers_dir
         self._mtime = -1.0
+        self._folder_stamp: tuple[tuple[str, float], ...] = ()
         self._by_id: dict[str, StickerEntry] = {}
         self._by_md5: dict[str, str] = {}
 
     def invalidate(self) -> None:
-        """Force reload on the next lookup (after library upsert)."""
+        """Force reload on the next lookup (after library upsert or folder drop)."""
         self._mtime = -1.0
+        self._folder_stamp = ()
 
     def path_for(self, sticker_id: str) -> Path | None:
         """Return the absolute image path for an id, or None if unknown/missing."""
@@ -85,46 +89,63 @@ class StickerCatalog:
         for sticker_id in self.known_ids():
             entry = self._by_id[sticker_id]
             learned = "·学来的" if entry.source == "learned" else ""
+            dropped = "·文件夹" if entry.source == "folder" else ""
+            mark = learned or dropped
             desc = (entry.description or "").strip()
             tags = "、".join(entry.tags) if entry.tags else ""
             if desc:
-                suffix = f"（{tags}{learned}）" if tags or learned else ""
+                suffix = f"（{tags}{mark}）" if tags or mark else ""
                 lines.append(
                     f"- {sticker_id} — {desc}{suffix} → [[sticker:{sticker_id}]]"
                 )
             elif tags:
                 lines.append(
-                    f"- {sticker_id}（{tags}{learned}）→ [[sticker:{sticker_id}]]"
+                    f"- {sticker_id}（{tags}{mark}）→ [[sticker:{sticker_id}]]"
                 )
             else:
-                lines.append(f"- {sticker_id}{learned} → [[sticker:{sticker_id}]]")
+                lines.append(f"- {sticker_id}{mark} → [[sticker:{sticker_id}]]")
         if not lines:
             return ""
         return (
-            "【可用本地表情（偶尔用，每轮最多 2 个；按描述选 id；含学来的条目；禁止编造未列出的 id）】\n"
+            "【可用本地表情（偶尔用，每轮最多 2 个；按描述选 id；含学来的与文件夹里的文件；禁止编造未列出的 id）】\n"
             + "\n".join(lines)
         )
 
     def _reload_if_changed(self) -> None:
-        """Reload the toml index when it appears or its mtime changes."""
+        """Reload when stickers.toml or files in the stickers folder change."""
+        index_mtime = (
+            self._index_path.stat().st_mtime if self._index_path.is_file() else -1.0
+        )
+        folder_stamp = _folder_stamp(self._stickers_dir)
+        if index_mtime == self._mtime and folder_stamp == self._folder_stamp:
+            return
+        by_id, by_md5 = self._load_index_rows()
+        _merge_folder_files(by_id, by_md5, self._stickers_dir)
+        self._by_id = by_id
+        self._by_md5 = by_md5
+        self._mtime = index_mtime
+        self._folder_stamp = folder_stamp
+        _log.info(
+            "loaded stickers index=%s dir=%s count=%s",
+            self._index_path,
+            self._stickers_dir,
+            len(by_id),
+        )
+
+    def _load_index_rows(self) -> tuple[dict[str, StickerEntry], dict[str, str]]:
+        """Parse stickers.toml rows that still have files on disk."""
+        by_id: dict[str, StickerEntry] = {}
+        by_md5: dict[str, str] = {}
         if not self._index_path.is_file():
-            self._by_id = {}
-            self._by_md5 = {}
-            self._mtime = -1.0
-            return
-        mtime = self._index_path.stat().st_mtime
-        if mtime == self._mtime:
-            return
+            return by_id, by_md5
         try:
             data = tomllib.loads(self._index_path.read_text(encoding="utf-8"))
         except (OSError, tomllib.TOMLDecodeError):
             _log.exception("failed to load stickers index %s", self._index_path)
-            return
+            return by_id, by_md5
         rows = data.get("sticker") if isinstance(data, dict) else None
         if not isinstance(rows, list):
             rows = []
-        by_id: dict[str, StickerEntry] = {}
-        by_md5: dict[str, str] = {}
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -150,9 +171,7 @@ class StickerCatalog:
                 if isinstance(tags_raw, list) and str(item).strip()
             )
             digest = str(row.get("md5") or "").strip().lower()
-            description = " ".join(str(row.get("description") or "").split())
-            if len(description) > 80:
-                description = description[:79].rstrip() + "…"
+            description = truncate_description(str(row.get("description") or ""))
             source = str(row.get("source") or "").strip()
             by_id[sticker_id] = StickerEntry(
                 id=sticker_id,
@@ -164,11 +183,58 @@ class StickerCatalog:
             )
             if digest:
                 by_md5[digest] = sticker_id
-        self._by_id = by_id
-        self._by_md5 = by_md5
-        self._mtime = mtime
-        _log.info(
-            "loaded stickers index=%s count=%s",
-            self._index_path,
-            len(by_id),
+        return by_id, by_md5
+
+
+def _folder_stamp(stickers_dir: Path) -> tuple[tuple[str, float], ...]:
+    """Snapshot of image filenames and mtimes so dropped files trigger a reload."""
+    if not stickers_dir.is_dir():
+        return ()
+    items: list[tuple[str, float]] = []
+    for path in stickers_dir.iterdir():
+        if not path.is_file() or path.suffix.lower() not in _ALLOWED_SUFFIXES:
+            continue
+        try:
+            items.append((path.name, path.stat().st_mtime))
+        except OSError:
+            continue
+    return tuple(sorted(items))
+
+
+def _merge_folder_files(
+    by_id: dict[str, StickerEntry],
+    by_md5: dict[str, str],
+    stickers_dir: Path,
+) -> None:
+    """Add PNG/JPG/GIF files that are not already listed in stickers.toml."""
+    if not stickers_dir.is_dir():
+        return
+    listed = {entry.path.resolve() for entry in by_id.values()}
+    for path in sorted(stickers_dir.iterdir()):
+        if not path.is_file() or path.suffix.lower() not in _ALLOWED_SUFFIXES:
+            continue
+        resolved = path.resolve()
+        if resolved in listed:
+            continue
+        try:
+            digest = content_md5(path.read_bytes())
+        except OSError:
+            _log.warning("skip sticker file unreadable %s", path)
+            continue
+        if digest in by_md5:
+            continue
+        sticker_id = normalize_sticker_id(path.stem, digest)
+        if sticker_id in by_id:
+            sticker_id = f"s_{digest[:10]}"
+        stem = path.stem.replace("_", " ").strip() or sticker_id
+        by_id[sticker_id] = StickerEntry(
+            id=sticker_id,
+            path=resolved,
+            tags=(),
+            md5=digest,
+            description=truncate_description(stem),
+            source="folder",
         )
+        by_md5[digest] = sticker_id
+        listed.add(resolved)
+        _log.info("sticker folder scan id=%s file=%s", sticker_id, path.name)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 import tomllib
 from dataclasses import dataclass
@@ -14,6 +15,17 @@ from app.qq.events import IncomingMessage
 
 _log = logging.getLogger(__name__)
 _BEIJING = ZoneInfo("Asia/Shanghai")
+
+SPEAK_AUTO = "auto"
+SPEAK_ALL = "all"
+SPEAK_MENTION_QUOTE = "mention_quote"
+SPEAK_MODES = (SPEAK_AUTO, SPEAK_ALL, SPEAK_MENTION_QUOTE)
+SPEAK_MODE_LABELS = {
+    SPEAK_AUTO: "自动",
+    SPEAK_ALL: "全部尝试回复",
+    SPEAK_MENTION_QUOTE: "仅@和引用回复",
+}
+_SPEAK_ASSIGN = re.compile(r'(?m)^(\s*speak_mode\s*=\s*)(["\']).*?\2')
 
 
 @dataclass(frozen=True)
@@ -36,6 +48,7 @@ class ReplySettings:
     bot_names: tuple[str, ...] = ()
     unmentioned_thread_minutes: float = 30.0
     unmentioned_off_peak_only: bool = True
+    speak_mode: str = SPEAK_AUTO
 
 
 def default_settings() -> ReplySettings:
@@ -81,6 +94,42 @@ def load_reply_settings(path: Path) -> ReplySettings:
         unmentioned_off_peak_only=bool(
             data.get("unmentioned_off_peak_only", base.unmentioned_off_peak_only)
         ),
+        speak_mode=normalize_speak_mode(data.get("speak_mode", base.speak_mode)),
+    )
+
+
+def normalize_speak_mode(value: object) -> str:
+    """Map a toml/UI value to auto / all / mention_quote."""
+    key = str(value or "").strip().lower()
+    if key in SPEAK_MODES:
+        return key
+    return SPEAK_AUTO
+
+
+def next_speak_mode(current: str) -> str:
+    """Return the next mode in the console cycle: auto → all → mention_quote."""
+    key = normalize_speak_mode(current)
+    index = SPEAK_MODES.index(key)
+    return SPEAK_MODES[(index + 1) % len(SPEAK_MODES)]
+
+
+def speak_mode_label(mode: str) -> str:
+    """Chinese label for the console speak-mode button."""
+    return SPEAK_MODE_LABELS[normalize_speak_mode(mode)]
+
+
+def upsert_speak_mode_text(text: str, mode: str) -> str:
+    """Replace or append speak_mode in reply_policy.toml without dropping comments."""
+    mode = normalize_speak_mode(mode)
+    raw = text or ""
+    if _SPEAK_ASSIGN.search(raw):
+        return _SPEAK_ASSIGN.sub(rf'\1"{mode}"', raw, count=1)
+    line = f'speak_mode = "{mode}"'
+    if not raw.strip():
+        return line + "\n"
+    return raw.rstrip() + (
+        "\n\n# 群发言模式：auto=自动 / all=全部尝试回复 / mention_quote=仅@和引用\n"
+        f"{line}\n"
     )
 
 
@@ -174,11 +223,15 @@ class ReplyGate:
             self._record_hit(message.session_id, stamp)
             return None
         if not message.mentioned:
-            if policy.unmentioned_off_peak_only and is_beijing_unmentioned_peak(stamp):
-                return "unmentioned_peak_hours"
-            reason = _unmentioned_skip(message, policy, self, stamp)
-            if reason:
-                return reason
+            mode = normalize_speak_mode(policy.speak_mode)
+            if mode == SPEAK_MENTION_QUOTE:
+                return "unmentioned_off"
+            if mode != SPEAK_ALL:
+                if policy.unmentioned_off_peak_only and is_beijing_unmentioned_peak(stamp):
+                    return "unmentioned_peak_hours"
+                reason = _unmentioned_skip(message, policy, self, stamp)
+                if reason:
+                    return reason
             group_id = message.group_openid or ""
             last = self._unat_at.get(group_id, 0.0)
             if last > 0 and stamp - last < policy.unmentioned_cooldown_seconds:

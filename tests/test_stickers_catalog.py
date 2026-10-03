@@ -14,6 +14,12 @@ def _png(path: Path) -> None:
     Image.new("RGB", (8, 8), (1, 2, 3)).save(path)
 
 
+def _gif(path: Path) -> None:
+    """Write a tiny GIF so folder-scan tests cover animated stickers."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (8, 8), (9, 8, 7)).save(path, format="GIF")
+
+
 def test_catalog_loads_existing_file(tmp_path: Path) -> None:
     """Known id resolves to the on-disk PNG path."""
     stickers = tmp_path / "stickers"
@@ -45,6 +51,50 @@ def test_catalog_skips_missing_file(tmp_path: Path) -> None:
     catalog = StickerCatalog(index, stickers)
     assert catalog.path_for("gone") is None
     assert catalog.known_ids() == []
+
+
+def test_catalog_scans_dropped_jpg_and_gif(tmp_path: Path) -> None:
+    """Files dropped into the folder are usable without a toml row."""
+    stickers = tmp_path / "stickers"
+    stickers.mkdir()
+    Image.new("RGB", (8, 8), (4, 5, 6)).save(stickers / "loading.jpg")
+    _gif(stickers / "spin.gif")
+    index = tmp_path / "stickers.toml"
+    index.write_text("# empty index\n", encoding="utf-8")
+    catalog = StickerCatalog(index, stickers)
+    assert catalog.path_for("loading") == (stickers / "loading.jpg").resolve()
+    assert catalog.path_for("spin") == (stickers / "spin.gif").resolve()
+    ids = catalog.known_ids()
+    assert "loading" in ids
+    assert "spin" in ids
+    block = catalog.prompt_block()
+    assert "[[sticker:loading]]" in block
+    assert "[[sticker:spin]]" in block
+
+
+def test_catalog_picks_up_new_file_without_toml_change(tmp_path: Path) -> None:
+    """Adding a GIF after first load is visible on the next lookup."""
+    stickers = tmp_path / "stickers"
+    stickers.mkdir()
+    index = tmp_path / "stickers.toml"
+    index.write_text("# empty\n", encoding="utf-8")
+    catalog = StickerCatalog(index, stickers)
+    assert catalog.known_ids() == []
+    _gif(stickers / "wave.gif")
+    assert catalog.path_for("wave") is not None
+    assert "wave" in catalog.known_ids()
+
+
+def test_parse_reply_segments_sticker_then_text() -> None:
+    """A marker on its own line becomes a sticker segment, not visible text."""
+    segs = parse_reply_segments(
+        "[[sticker:facepalm]]\n\n行吧，给你一个。",
+        known_ids={"facepalm", "loading"},
+    )
+    assert segs == [
+        StickerSeg(sticker_id="facepalm"),
+        TextSeg(text="行吧，给你一个。"),
+    ]
 
 
 def test_parse_reply_segments_mixed() -> None:

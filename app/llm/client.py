@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 
 from app.config import Settings
+from app.personas.catalog import PersonaCatalog
 from app.prompt_book import PromptBook
 
 _log = logging.getLogger(__name__)
@@ -43,7 +44,15 @@ class LLMClient:
         stickers_prompt: str = "",
     ) -> None:
         self._settings = settings
-        self._prompts = prompts or PromptBook(settings.bot_prompt_path)
+        if prompts is not None:
+            self._prompts = prompts
+        else:
+            catalog = PersonaCatalog(
+                settings.personas_index_path,
+                settings.personas_dir,
+                json_migrate_path=settings.bot_prompt_path,
+            )
+            self._prompts = PromptBook(catalog)
         self._stickers_prompt = stickers_prompt
         self._slot = threading.Lock()
 

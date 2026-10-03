@@ -3,19 +3,18 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import logging
 import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import Image
+from app.stickers.format import encode_for_library
 
 _log = logging.getLogger(__name__)
 
 _ID_RE = re.compile(r"^[a-z0-9_]{2,32}$")
-_ALLOWED = frozenset({".png", ".jpg", ".jpeg"})
+_ALLOWED = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
 _DESC_MAX = 80
 
 
@@ -53,20 +52,8 @@ def content_md5(data: bytes) -> str:
 
 
 def encode_sticker_image(data: bytes, mime: str) -> tuple[bytes, str, str]:
-    """Normalize bytes to PNG (preferred) or JPEG; return (bytes, suffix, mime)."""
-    safe = (mime or "image/jpeg").split(";")[0].strip().lower()
-    if safe == "image/png":
-        return data, ".png", "image/png"
-    if safe in {"image/jpeg", "image/jpg"}:
-        return data, ".jpg", "image/jpeg"
-    try:
-        image = Image.open(io.BytesIO(data)).convert("RGB")
-        buf = io.BytesIO()
-        image.save(buf, format="PNG")
-        return buf.getvalue(), ".png", "image/png"
-    except Exception:
-        _log.exception("sticker re-encode failed; storing jpeg fallback")
-        return data, ".jpg", "image/jpeg"
+    """Persist inbound sticker bytes unchanged; suffix follows the file magic."""
+    return encode_for_library(data, mime)
 
 
 class StickerLibrary:
@@ -248,7 +235,7 @@ class StickerLibrary:
     def _write_rows(self, rows: list[dict]) -> None:
         """Rewrite stickers.toml from row dicts (preserves learned + manual entries)."""
         lines = [
-            "# Local outbound stickers (PNG/JPG). Files live under data/stickers/ by default.",
+            "# Local outbound stickers. Files live under data/stickers/ by default.",
             "# Model replies may embed [[sticker:id]] to send one.",
             "# Entries with source = \"learned\" were auto-collected from inbound stickers.",
             "",

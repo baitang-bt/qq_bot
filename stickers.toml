@@ -1,8 +1,25 @@
 # Local outbound stickers (PNG/JPG). Files live under data/stickers/ by default.
 # Model replies may embed [[sticker:id]] to send one.
+# Entries with source = "learned" were auto-collected from inbound stickers.
 
 [[sticker]]
 id = "facepalm"
 file = "facepalm.png"
 tags = ["捂脸", "无奈"]
 description = "一只猫捂脸，无奈"
+
+[[sticker]]
+id = "looking_down_dude"
+file = "looking_down_dude.jpg"
+tags = ["无语", "俯视", "冷漠", "反应"]
+md5 = "fefbce8972a5b92e61801f6766071b86"
+description = "一名穿黑衣的男子低头俯视，表情阴郁冷淡，带有审视或无语的意味。"
+source = "learned"
+
+[[sticker]]
+id = "pixel_goldfish_headphones"
+file = "pixel_goldfish_headphones.jpg"
+tags = ["像素", "金鱼", "耳机", "可爱", "呆萌"]
+md5 = "60d9a754fb0c9639a24719fcd1419ac5"
+description = "一只像素风橙色金鱼戴着黑色耳机，背景为纯橙色，画面简洁可爱，带有呆萌、专注听歌的情绪。"
+source = "learned"

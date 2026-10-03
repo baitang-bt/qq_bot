@@ -1,0 +1,8 @@
+# Persona packs. Text files live under data/personas/<id>/ by default.
+# Only active is sent to the model; switch in the admin console.
+
+active = "0x01"
+
+[[persona]]
+id = "0x01"
+title = "默认"

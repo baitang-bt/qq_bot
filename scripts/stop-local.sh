@@ -25,3 +25,14 @@ stop_pidfile() {
 
 stop_pidfile "$PID_DIR/uvicorn.pid" "uvicorn"
 stop_pidfile "$PID_DIR/ngrok.pid" "ngrok"
+
+# 结束仍占 8080 的本项目 uvicorn（pid 文件丢失时旧进程会把新启动挤掉）。
+if command -v lsof >/dev/null; then
+  for pid in $(lsof -nP -iTCP:8080 -sTCP:LISTEN -t 2>/dev/null); do
+    cmd=$(ps -p "$pid" -o args= 2>/dev/null || true)
+    if [[ "$cmd" == *"app.main:app"* ]]; then
+      kill "$pid" 2>/dev/null || true
+      echo "已结束占用 8080 的旧 uvicorn pid=$pid"
+    fi
+  done
+fi

@@ -10,7 +10,7 @@ from PIL import Image
 
 from app.config import Settings
 from app.qq.events import C2C_EVENT, IncomingMessage
-from app.qq.media import MediaUploader, file_checksums
+from app.qq.media import MediaUploader, file_checksums, _bytes_for_upload
 from app.qq.reply import ReplyClient
 
 
@@ -31,6 +31,8 @@ def _settings(tmp_path: Path) -> Settings:
         data_dir=tmp_path,
         reply_policy_path=tmp_path / "reply_policy.toml",
         bot_prompt_path=tmp_path / "bot_prompt.json",
+        personas_dir=tmp_path / "personas",
+        personas_index_path=tmp_path / "personas.toml",
         qq_id="",
         host="127.0.0.1",
         port=8080,
@@ -51,6 +53,26 @@ def test_file_checksums_stable() -> None:
     assert md5 == hashlib.md5(data).hexdigest()
     assert sha1 == hashlib.sha1(data).hexdigest()
     assert md5_10m == hashlib.md5(data[:10_002_432]).hexdigest()
+
+
+def test_bytes_for_upload_keeps_gif_animation(tmp_path: Path) -> None:
+    """GIF stickers are uploaded as GIF bytes, not a JPEG first frame."""
+    path = tmp_path / "spin.gif"
+    first = Image.new("RGB", (4, 4), (2, 3, 4))
+    second = Image.new("RGB", (4, 4), (4, 3, 2))
+    first.save(
+        path,
+        format="GIF",
+        save_all=True,
+        append_images=[second],
+        duration=40,
+        loop=0,
+    )
+    raw = path.read_bytes()
+    data, name = _bytes_for_upload(path)
+    assert name == "spin.gif"
+    assert data.startswith(b"GIF8")
+    assert data == raw
 
 
 def test_upload_image_chunked_flow(tmp_path: Path) -> None:
@@ -149,7 +171,7 @@ def test_send_image_posts_msg_type_7(tmp_path: Path) -> None:
     )
     captured: dict = {}
 
-    async def fake_post(_msg, payload):
+    async def fake_post(_msg, payload, **_kwargs):
         captured["payload"] = payload
         return True
 

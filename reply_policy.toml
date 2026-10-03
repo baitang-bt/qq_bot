@@ -31,4 +31,6 @@ unmentioned_need_hook = false
 unmentioned_thread_minutes = 1
 # 北京时间周一至周五 9:00-12:00、14:00-18:00 仅拦截「非@且未引用 bot」消息；@ 与引用 bot 仍回复
 unmentioned_off_peak_only = true
+# 群发言模式：auto=自动（沿用上面未@规则）/ all=全部尝试回复 / mention_quote=仅@和引用
+speak_mode = "auto"
 bot_names = ["0x01", "bot"]

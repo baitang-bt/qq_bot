@@ -80,7 +80,11 @@ class ReplyClient:
                     "message_id": quote_id,
                     "ignore_get_message_error": True,
                 }
-        ok = await self._post(message, payload)
+        ok = await self._post(
+            message,
+            payload,
+            remember_text=f"[发送图片:{path.name}]",
+        )
         if ok:
             _log.info("sent image path=%s", path.name)
         return ok
@@ -187,7 +191,13 @@ class ReplyClient:
         }
         await self._post(message, payload)
 
-    async def _post(self, message: IncomingMessage, payload: dict) -> bool:
+    async def _post(
+        self,
+        message: IncomingMessage,
+        payload: dict,
+        *,
+        remember_text: str = "",
+    ) -> bool:
         """POST a message payload to the C2C or group messages endpoint."""
         if message.is_group:
             path = f"/v2/groups/{message.group_openid}/messages"
@@ -204,22 +214,67 @@ class ReplyClient:
                 response.text[:400],
             )
             return False
-        text = str(payload.get("content") or "").strip()
-        if text:
-            out_id = ""
-            try:
-                body = response.json()
-                if isinstance(body, dict):
-                    out_id = str(body.get("id") or body.get("msg_id") or "")
-            except ValueError:
-                out_id = ""
-            message_cache.remember_bot(
-                out_id,
-                text,
-                group_openid=message.group_openid,
-                user_openid=message.user_openid,
-            )
+        # Typing indicators are not chat messages — skip quote cache.
+        if int(payload.get("msg_type") or 0) == 6:
+            return True
+        text = (remember_text or str(payload.get("content") or "")).strip()
+        ref_idx, out_id = parse_send_response_ids(response)
+        remember_outbound_send(
+            message,
+            text=text,
+            ref_idx=ref_idx,
+            out_id=out_id,
+        )
         return True
+
+
+def parse_send_response_ids(response: httpx.Response) -> tuple[str, str]:
+    """Read ext_info.ref_idx and message id from a QQ send response."""
+    try:
+        body = response.json()
+    except ValueError:
+        return "", ""
+    if not isinstance(body, dict):
+        return "", ""
+    ext = body.get("ext_info")
+    ref_idx = ""
+    if isinstance(ext, dict):
+        ref_idx = str(ext.get("ref_idx") or "").strip()
+    out_id = str(body.get("id") or body.get("msg_id") or "").strip()
+    return ref_idx, out_id
+
+
+def remember_outbound_send(
+    message: IncomingMessage,
+    *,
+    text: str,
+    ref_idx: str,
+    out_id: str,
+) -> None:
+    """Cache outbound bot text under REFIDX (required for inbound quote lookup)."""
+    body = (text or "").strip()
+    key = (ref_idx or "").strip()
+    alt = (out_id or "").strip()
+    if key:
+        message_cache.remember_bot(
+            key,
+            body or "[消息]",
+            group_openid=message.group_openid,
+            user_openid=message.user_openid,
+            alt_id=alt,
+        )
+        _log.info("remember_bot ref_idx=%s chars=%s", key[:28], len(body))
+        return
+    if alt and body:
+        # Do not mark ROBOT1.0 ids as bot REFIDX — inbound uses ref_msg_idx.
+        message_cache.remember(alt, body)
+        _log.warning(
+            "send missing ext_info.ref_idx; cached id only id=%s",
+            alt[:28],
+        )
+        return
+    if not key:
+        _log.warning("send missing ext_info.ref_idx and usable id")
 
 
 def user_turns_since_last_bot(history: list[dict[str, str]]) -> int:

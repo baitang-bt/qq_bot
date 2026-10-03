@@ -1,6 +1,5 @@
 """Admin dashboard HTTP API."""
 
-import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -27,21 +26,19 @@ def test_admin_page_and_status(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_admin_prompt_roundtrip(tmp_path: Path, monkeypatch) -> None:
-    """Prompt can be read and written through the admin API."""
-    prompt_path = tmp_path / "bot_prompt.json"
-    prompt_path.write_text(
-        json.dumps({"persona": "test", "anti_injection": ["a"], "stay_on_prompt": ["b"]}),
-        encoding="utf-8",
-    )
+    """Active persona reserved txts can be read and written through the admin API."""
     monkeypatch.setenv("QQ_APP_ID", "app")
     monkeypatch.setenv("QQ_APP_SECRET", "secret-secret-secret-secret-1234")
-    monkeypatch.setenv("BOT_PROMPT_PATH", str(prompt_path))
+    monkeypatch.setenv("BOT_PROMPT_PATH", str(tmp_path / "bot_prompt.json"))
+    monkeypatch.setenv("PERSONAS_DIR", str(tmp_path / "personas"))
+    monkeypatch.setenv("PERSONAS_INDEX_PATH", str(tmp_path / "personas.toml"))
     client = TestClient(create_app())
-    got = client.get("/admin/api/prompt").json()
-    assert got["persona"] == "test"
+    listed = client.get("/admin/api/personas")
+    assert listed.status_code == 200
     client.put(
         "/admin/api/prompt",
         json={"persona": "new", "anti_injection": ["x"], "stay_on_prompt": []},
     )
-    saved = json.loads(prompt_path.read_text(encoding="utf-8"))
-    assert saved["persona"] == "new"
+    got = client.get("/admin/api/prompt").json()
+    assert got["persona"].strip() == "new"
+    assert got["anti_injection"] == ["x"]

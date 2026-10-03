@@ -16,11 +16,36 @@ _STATIC = Path(__file__).resolve().parent / "static"
 
 
 class PromptBody(BaseModel):
-    """Editable bot_prompt.json fields."""
+    """Editable fields for the legacy prompt JSON shape."""
 
     persona: str = ""
     anti_injection: list[str] = Field(default_factory=list)
     stay_on_prompt: list[str] = Field(default_factory=list)
+
+
+class PersonaFileBody(BaseModel):
+    """One txt file inside a persona pack."""
+
+    text: str = ""
+
+
+class PersonaActiveBody(BaseModel):
+    """Enable one persona pack."""
+
+    id: str
+
+
+class PersonaNewBody(BaseModel):
+    """Create a persona pack."""
+
+    id: str
+    title: str = ""
+
+
+class PersonaNewFileBody(BaseModel):
+    """Create an empty txt in a pack."""
+
+    name: str
 
 
 class ReplyPolicyBody(BaseModel):
@@ -104,9 +129,74 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
         return {"running": snap.running, "healthy": snap.healthy, "pid": snap.pid}
 
+    @router.get("/admin/api/personas")
+    def get_personas() -> dict[str, object]:
+        """List persona packs and the active id."""
+        try:
+            packs = store.list_persona_packs()
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"active": store.persona_active_id(), "packs": packs}
+
+    @router.put("/admin/api/personas/active")
+    def put_persona_active(body: PersonaActiveBody) -> dict[str, str]:
+        """Enable one persona pack."""
+        try:
+            active = store.set_persona_active(body.id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": "saved", "active": active}
+
+    @router.post("/admin/api/personas")
+    def post_persona(body: PersonaNewBody) -> dict[str, object]:
+        """Create a persona pack."""
+        try:
+            row = store.new_persona_pack(body.id, body.title)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": "created", "pack": row}
+
+    @router.delete("/admin/api/personas/{persona_id}")
+    def delete_persona(persona_id: str) -> dict[str, str]:
+        """Delete a non-active persona pack."""
+        try:
+            store.delete_persona_pack(persona_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": "deleted"}
+
+    @router.get("/admin/api/personas/{persona_id}/files/{filename}")
+    def get_persona_file(persona_id: str, filename: str) -> dict[str, str]:
+        """Read one txt from a pack."""
+        return {
+            "id": persona_id,
+            "name": filename,
+            "text": store.read_persona_file(persona_id, filename),
+        }
+
+    @router.put("/admin/api/personas/{persona_id}/files/{filename}")
+    def put_persona_file(
+        persona_id: str, filename: str, body: PersonaFileBody
+    ) -> dict[str, str]:
+        """Write one txt in a pack."""
+        try:
+            path = store.save_persona_file(persona_id, filename, body.text)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": "saved", "path": str(path)}
+
+    @router.post("/admin/api/personas/{persona_id}/files")
+    def post_persona_file(persona_id: str, body: PersonaNewFileBody) -> dict[str, str]:
+        """Create an empty txt in a pack."""
+        try:
+            path = store.add_persona_file(persona_id, body.name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": "created", "path": str(path)}
+
     @router.get("/admin/api/prompt")
     def get_prompt() -> dict[str, object]:
-        """Read bot_prompt.json."""
+        """Read reserved txts of the active persona pack."""
         try:
             data = store.read_prompt()
         except (OSError, ValueError) as exc:
@@ -120,7 +210,7 @@ def create_router() -> APIRouter:
 
     @router.put("/admin/api/prompt")
     def put_prompt(body: PromptBody) -> dict[str, str]:
-        """Write bot_prompt.json."""
+        """Write reserved txts of the active persona pack."""
         path = store.save_prompt(body.persona, body.anti_injection, body.stay_on_prompt)
         return {"ok": "saved", "path": str(path)}
 

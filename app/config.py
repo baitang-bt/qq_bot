@@ -59,6 +59,8 @@ class Settings:
     data_dir: Path
     reply_policy_path: Path
     bot_prompt_path: Path
+    personas_dir: Path
+    personas_index_path: Path
     qq_id: str
     host: str
     port: int
@@ -77,6 +79,8 @@ def load_settings() -> Settings:
     data_dir.mkdir(parents=True, exist_ok=True)
     stickers_dir = Path(_env("STICKERS_DIR") or str(data_dir / "stickers"))
     stickers_dir.mkdir(parents=True, exist_ok=True)
+    personas_dir = Path(_env("PERSONAS_DIR") or str(data_dir / "personas"))
+    personas_dir.mkdir(parents=True, exist_ok=True)
     return Settings(
         qq_app_id=_env("QQ_APP_ID"),
         qq_app_secret=_env("QQ_APP_SECRET"),
@@ -94,6 +98,10 @@ def load_settings() -> Settings:
         data_dir=data_dir,
         reply_policy_path=Path(_env("REPLY_POLICY_PATH") or str(_ROOT / "reply_policy.toml")),
         bot_prompt_path=Path(_env("BOT_PROMPT_PATH") or str(_ROOT / "bot_prompt.json")),
+        personas_dir=personas_dir,
+        personas_index_path=Path(
+            _env("PERSONAS_INDEX_PATH") or str(_ROOT / "personas.toml")
+        ),
         qq_id=_env("QQ_ID"),
         host=_env("HOST", "0.0.0.0"),
         port=_env_int("PORT", 8080),

@@ -13,7 +13,7 @@ _bot_texts: dict[str, deque[str]] = {}
 
 
 def remember(msg_idx: str, text: str) -> None:
-    """Store one seen message body keyed by platform msg_idx."""
+    """Store one seen message body keyed by platform msg_idx (or message id)."""
     key = (msg_idx or "").strip()
     body = (text or "").strip()
     if not key or not body:
@@ -26,13 +26,27 @@ def remember(msg_idx: str, text: str) -> None:
         _bot_msg_idx.discard(evicted)
 
 
-def remember_bot(msg_idx: str, text: str, *, group_openid: str | None, user_openid: str) -> None:
-    """Mark an outbound bot message so quote replies can match ref_msg_idx or text."""
+def remember_bot(
+    msg_idx: str,
+    text: str,
+    *,
+    group_openid: str | None,
+    user_openid: str,
+    alt_id: str = "",
+) -> None:
+    """Mark an outbound bot message.
+
+    ``msg_idx`` should be ``ext_info.ref_idx`` (REFIDX_*). Only that key enters
+    ``_bot_msg_idx``. ``alt_id`` (response ``id``) is stored for text lookup only.
+    """
     key = (msg_idx or "").strip()
     body = (text or "").strip()
+    alt = (alt_id or "").strip()
     if key:
         remember(key, body)
         _bot_msg_idx.add(key)
+    if alt and alt != key and body:
+        remember(alt, body)
     if body:
         scope = _bot_scope(group_openid, user_openid)
         bucket = _bot_texts.setdefault(scope, deque(maxlen=_MAX_BOT_TEXTS))
@@ -41,7 +55,7 @@ def remember_bot(msg_idx: str, text: str, *, group_openid: str | None, user_open
 
 
 def is_bot_msg_idx(msg_idx: str) -> bool:
-    """True when this ref_msg_idx was sent by the bot."""
+    """True when this ref_msg_idx was sent by the bot (REFIDX from ext_info.ref_idx)."""
     key = (msg_idx or "").strip()
     return bool(key and key in _bot_msg_idx)
 

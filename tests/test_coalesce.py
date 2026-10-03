@@ -37,6 +37,37 @@ def test_merge_inbound_messages_joins_text() -> None:
     assert merged.user_text == "你好\n在吗"
 
 
+def test_merge_quote_not_double_wrapped() -> None:
+    """Coalesced bursts keep a single [引用] layer and preserve quotes_bot."""
+    first = IncomingMessage(
+        event_type=GROUP_MESSAGE_EVENT,
+        event_id="e1",
+        msg_id="m1",
+        content="怎么这个像豆包",
+        user_openid="u1",
+        group_openid="g1",
+        quoted_text="哦就是那种原汁原味",
+        quotes_bot=True,
+        ref_msg_idx="REFIDX_bot==",
+        message_type=103,
+    )
+    second = IncomingMessage(
+        event_type=GROUP_MESSAGE_EVENT,
+        event_id="e2",
+        msg_id="m2",
+        content="你再说一遍",
+        user_openid="u1",
+        group_openid="g1",
+    )
+    merged = merge_inbound_messages([first, second])
+    assert merged.quotes_bot is True
+    assert merged.quoted_text == "哦就是那种原汁原味"
+    assert merged.user_text.count("[引用]") == 1
+    assert "怎么这个像豆包" in merged.user_text
+    assert "你再说一遍" in merged.user_text
+    assert "[消息]" in merged.user_text
+
+
 def test_merge_marks_mentioned_if_any_line_was_at() -> None:
     """A burst that started with @ stays eligible for @ reply policy."""
     merged = merge_inbound_messages(

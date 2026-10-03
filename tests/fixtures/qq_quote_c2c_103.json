@@ -1,0 +1,24 @@
+{
+  "op": 0,
+  "t": "C2C_MESSAGE_CREATE",
+  "id": "evt-quote-1",
+  "d": {
+    "id": "ROBOT1.0_inbound_quote_msg",
+    "content": "这个建议很有帮助，谢谢你！",
+    "message_type": 103,
+    "author": {"user_openid": "user-aaa"},
+    "msg_elements": [
+      {
+        "msg_idx": "REFIDX_aaaaaaaaaaaaaaa==",
+        "message_type": 0,
+        "content": "每天坚持阅读半小时，一个月后你会发现自己的变化"
+      }
+    ],
+    "message_scene": {
+      "ext": [
+        "ref_msg_idx=REFIDX_aaaaaaaaaaaaaaa==",
+        "msg_idx=REFIDX_zzzzzzzzzzzzzzz=="
+      ]
+    }
+  }
+}

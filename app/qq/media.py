@@ -12,11 +12,21 @@ import httpx
 from app.config import Settings
 from app.qq.events import IncomingMessage
 from app.qq.token import TokenManager
+from app.stickers.format import (
+    KIND_GIF,
+    KIND_JPEG,
+    KIND_PNG,
+    KIND_WEBP,
+    detect_image_kind,
+    encode_for_library,
+)
 
 _log = logging.getLogger(__name__)
 
 _MD5_10M_BYTES = 10_002_432
 _FILE_TYPE_IMAGE = 1
+# QQ image messages list jpg/png/gif/webp/bmp; keep these bytes so GIF can animate.
+_IMAGE_CONTAINERS = frozenset({KIND_PNG, KIND_JPEG, KIND_GIF, KIND_WEBP})
 
 
 def file_checksums(data: bytes) -> tuple[str, str, str]:
@@ -28,7 +38,7 @@ def file_checksums(data: bytes) -> tuple[str, str, str]:
 
 
 class MediaUploader:
-    """Upload a local PNG/JPG via prepare → PUT parts → part_finish → files merge."""
+    """Upload a local PNG/JPG/GIF/WebP via prepare → PUT parts → part_finish → files merge."""
 
     def __init__(self, settings: Settings, tokens: TokenManager) -> None:
         self._settings = settings
@@ -37,7 +47,7 @@ class MediaUploader:
 
     async def upload_image(self, message: IncomingMessage, path: Path) -> str:
         """Upload a local image for this chat scene; return file_info for msg_type=7."""
-        data = path.read_bytes()
+        data, upload_name = _bytes_for_upload(path)
         if not data:
             raise RuntimeError(f"empty sticker file: {path}")
         md5, sha1, md5_10m = file_checksums(data)
@@ -58,7 +68,7 @@ class MediaUploader:
         prepare_body = {
             "file_type": _FILE_TYPE_IMAGE,
             "file_size": str(len(data)),
-            "file_name": path.name,
+            "file_name": upload_name,
             "md5": md5,
             "sha1": sha1,
             "md5_10m": md5_10m,
@@ -133,7 +143,7 @@ class MediaUploader:
                 "file_type": _FILE_TYPE_IMAGE,
                 "upload_id": upload_id,
                 "srv_send_msg": False,
-                "file_name": path.name,
+                "file_name": upload_name,
             }
             files_resp = await client.post(files_url, headers=headers, json=files_body)
             if files_resp.status_code >= 400:
@@ -174,3 +184,34 @@ def _target_id(message: IncomingMessage) -> str:
             raise RuntimeError("group message missing group_openid")
         return message.group_openid
     return message.user_openid
+
+
+def _bytes_for_upload(path: Path) -> tuple[bytes, str]:
+    """Read sticker bytes; GIF/WebP stay animated, unknown stills become PNG."""
+    data = path.read_bytes()
+    if not data:
+        return b"", path.name
+    kind = detect_image_kind(data)
+    if kind.container in _IMAGE_CONTAINERS:
+        return data, _upload_name(path.stem, kind.container, path.suffix)
+    encoded, suffix, _ = encode_for_library(data)
+    _log.info(
+        "sticker re-encoded for upload path=%s container=%s -> %s",
+        path.name,
+        kind.container,
+        suffix,
+    )
+    return encoded, f"{path.stem}{suffix}"
+
+
+def _upload_name(stem: str, container: str, suffix: str) -> str:
+    """Pick a filename QQ's image pipeline will accept for this container."""
+    if container == KIND_GIF:
+        return f"{stem}.gif"
+    if container == KIND_WEBP:
+        return f"{stem}.webp"
+    if container == KIND_PNG:
+        return f"{stem}.png"
+    if suffix.lower() in {".jpg", ".jpeg"}:
+        return f"{stem}{suffix.lower()}"
+    return f"{stem}.jpg"

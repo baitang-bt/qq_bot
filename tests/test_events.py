@@ -312,7 +312,7 @@ def test_ignore_unknown_event() -> None:
 
 
 def test_parse_quote_bot_by_ref_idx() -> None:
-    """ref_msg_idx pointing at a bot send sets quotes_bot."""
+    """ref_msg_idx pointing at a bot send sets quotes_bot and fills quoted_text from cache."""
     from app.qq import message_cache
 
     message_cache.clear_for_tests()
@@ -343,7 +343,88 @@ def test_parse_quote_bot_by_ref_idx() -> None:
     assert message is not None
     assert message.quotes_bot is True
     assert message.mentioned is False
+    assert "原汁原味" in message.quoted_text
     message_cache.clear_for_tests()
+
+
+def test_parse_quote_image_only_placeholder() -> None:
+    """Quoted attachments without text become a short image placeholder."""
+    payload = {
+        "op": 0,
+        "t": C2C_EVENT,
+        "d": {
+            "id": "msg-img-quote",
+            "content": "这啥",
+            "message_type": 103,
+            "author": {"user_openid": "user-aaa"},
+            "msg_elements": [
+                {
+                    "msg_idx": "REFIDX_pic==",
+                    "content": "",
+                    "attachments": [
+                        {
+                            "url": "https://example.com/sticker.png",
+                            "filename": "sticker.png",
+                            "content_type": "image/png",
+                            "size": 12,
+                        }
+                    ],
+                }
+            ],
+            "message_scene": {
+                "ext": [
+                    "ref_msg_idx=REFIDX_pic==",
+                    "msg_idx=REFIDX_newpic==",
+                ],
+            },
+        },
+    }
+    message = parse_incoming(payload)
+    assert message is not None
+    assert message.quoted_text == "[引用图片]"
+    assert "[引用]" in message.user_text
+
+
+def test_parse_quote_unresolved_empty() -> None:
+    """Missing elements and cache miss yields empty quoted_text without raising."""
+    from app.qq import message_cache
+
+    message_cache.clear_for_tests()
+    payload = {
+        "op": 0,
+        "t": C2C_EVENT,
+        "d": {
+            "id": "msg-miss",
+            "content": "啥意思",
+            "message_type": 103,
+            "author": {"user_openid": "user-aaa"},
+            "message_scene": {
+                "ext": ["ref_msg_idx=REFIDX_unknown==", "msg_idx=REFIDX_cur=="],
+            },
+        },
+    }
+    message = parse_incoming(payload)
+    assert message is not None
+    assert message.quoted_text == ""
+    assert message.user_text == "啥意思"
+    message_cache.clear_for_tests()
+
+
+def test_parse_quote_fixture_c2c_103() -> None:
+    """Golden C2C type-103 fixture resolves one layer of quoted text."""
+    import json
+    from pathlib import Path
+
+    payload = json.loads(
+        (Path(__file__).resolve().parent / "fixtures" / "qq_quote_c2c_103.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    message = parse_incoming(payload)
+    assert message is not None
+    assert message.quoted_text.startswith("每天坚持阅读")
+    assert message.user_text.count("[引用]") == 1
+    assert "这个建议很有帮助" in message.user_text
 
 
 def test_parse_quote_bot_by_author_flag() -> None:

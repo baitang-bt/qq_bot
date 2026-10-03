@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.qq import message_cache
+from app.qq.quote import resolve_quoted
 
 C2C_EVENT = "C2C_MESSAGE_CREATE"
 GROUP_AT_EVENT = "GROUP_AT_MESSAGE_CREATE"
@@ -91,18 +92,26 @@ class IncomingMessage:
     @property
     def asr_text(self) -> str:
         """Official ASR text from voice attachments, if the platform provided it."""
-        parts = [item.asr_refer_text.strip() for item in self.voice_attachments if item.asr_refer_text.strip()]
+        parts = [
+            item.asr_refer_text.strip()
+            for item in self.voice_attachments
+            if item.asr_refer_text.strip()
+        ]
         return " ".join(parts).strip()
+
+    @property
+    def spoken_text(self) -> str:
+        """Typed content plus ASR, without the quote wrapper used for the model."""
+        typed = self.content.strip()
+        asr = self.asr_text
+        if typed and asr:
+            return f"{typed}\n{asr}"
+        return typed or asr
 
     @property
     def user_text(self) -> str:
         """Text the model should treat as the user's utterance (typed, ASR, or quote)."""
-        typed = self.content.strip()
-        asr = self.asr_text
-        if typed and asr:
-            body = f"{typed}\n{asr}"
-        else:
-            body = typed or asr
+        body = self.spoken_text
         quote = self.quoted_text.strip()
         if not quote:
             return body
@@ -118,7 +127,7 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 def _attachment_content_type(entry: dict[str, Any]) -> str:
     """Read MIME type from content_type or content-type keys."""
-    for key in ("content_type", "content-type", "content_type"):
+    for key in ("content_type", "content-type"):
         value = entry.get(key)
         if value:
             return str(value)
@@ -222,89 +231,13 @@ def _collect_msg_elements_body(raw: Any) -> tuple[str, tuple[Attachment, ...]]:
         if content:
             texts.append(content)
         attachments.extend(_parse_attachments(entry.get("attachments")))
-        nested_text, nested_attachments = _collect_msg_elements_body(entry.get("msg_elements"))
+        nested_text, nested_attachments = _collect_msg_elements_body(
+            entry.get("msg_elements")
+        )
         if nested_text:
             texts.append(nested_text)
         attachments.extend(nested_attachments)
     return "\n".join(texts).strip(), tuple(attachments)
-
-
-def _extract_msg_elements_text(raw: Any) -> str:
-    """Flatten nested msg_elements into one quoted-text block."""
-    if not isinstance(raw, list):
-        return ""
-    parts: list[str] = []
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
-        content = str(entry.get("content") or "").strip()
-        if content:
-            parts.append(content)
-        nested = _extract_msg_elements_text(entry.get("msg_elements"))
-        if nested:
-            parts.append(nested)
-        for attachment in _parse_attachments(entry.get("attachments")):
-            asr = attachment.asr_refer_text.strip()
-            if asr:
-                parts.append(asr)
-    return "\n".join(parts).strip()
-
-
-def _msg_elements_quote_bot_author(raw: Any) -> bool:
-    """True when nested msg_elements mark the quoted author as the bot."""
-    if not isinstance(raw, list):
-        return False
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
-        author = _as_dict(entry.get("author"))
-        if author.get("bot") is True:
-            return True
-        if _msg_elements_quote_bot_author(entry.get("msg_elements")):
-            return True
-    return False
-
-
-def _detect_quotes_bot(
-    data: dict[str, Any],
-    scene_ext: dict[str, str],
-    message_type: int,
-    quoted_text: str,
-    *,
-    group_openid: str | None,
-    user_openid: str,
-) -> bool:
-    """True when the user quoted a recent bot message in this chat."""
-    ref_idx = scene_ext.get("ref_msg_idx", "").strip()
-    if ref_idx and message_cache.is_bot_msg_idx(ref_idx):
-        return True
-    if message_type == 103 or ref_idx:
-        if _msg_elements_quote_bot_author(data.get("msg_elements")):
-            return True
-    if quoted_text.strip():
-        return message_cache.quoted_matches_bot(
-            quoted_text,
-            group_openid=group_openid,
-            user_openid=user_openid,
-        )
-    return False
-
-
-def _resolve_quoted_text(
-    data: dict[str, Any],
-    scene_ext: dict[str, str],
-    message_type: int,
-) -> str:
-    """Read quoted message text for type 103 / ref_msg_idx, not parallel bodies."""
-    if message_type != 103 and not scene_ext.get("ref_msg_idx", "").strip():
-        return ""
-    quoted = _extract_msg_elements_text(data.get("msg_elements"))
-    if quoted:
-        return quoted
-    ref_idx = scene_ext.get("ref_msg_idx", "").strip()
-    if ref_idx:
-        return message_cache.lookup(ref_idx)
-    return ""
 
 
 def _merge_content_with_elements(content: str, element_text: str) -> str:
@@ -320,19 +253,11 @@ def _merge_content_with_elements(content: str, element_text: str) -> str:
     return f"{base}\n{extra}"
 
 
-def _remember_for_quotes(
-    msg_idx: str,
-    content: str,
-    asr_text: str,
-    quoted_text: str,
-) -> None:
-    """Cache this message's own body so later ref_msg_idx lookups can succeed."""
+def _remember_for_quotes(msg_idx: str, content: str, asr_text: str) -> None:
+    """Cache this message's own spoken body so later ref_msg_idx lookups can succeed."""
     body = content.strip() or asr_text.strip()
     if body:
         message_cache.remember(msg_idx, body)
-        return
-    if quoted_text.strip():
-        message_cache.remember(msg_idx, quoted_text.strip())
 
 
 def parse_incoming(payload: dict[str, Any]) -> IncomingMessage | None:
@@ -350,8 +275,6 @@ def parse_incoming(payload: dict[str, Any]) -> IncomingMessage | None:
         return None
     user_openid = str(
         author.get("user_openid")
-        or author.get("user_openid")
-        or author.get("member_openid")
         or author.get("member_openid")
         or author.get("id")
         or ""
@@ -364,10 +287,14 @@ def parse_incoming(payload: dict[str, Any]) -> IncomingMessage | None:
     element_text = ""
     element_attachments: tuple[Attachment, ...] = ()
     if message_type in {101, 102}:
-        element_text, element_attachments = _collect_msg_elements_body(data.get("msg_elements"))
+        element_text, element_attachments = _collect_msg_elements_body(
+            data.get("msg_elements")
+        )
         attachments = _merge_attachments(attachments, element_attachments)
     elif message_type != 103:
-        element_text, element_attachments = _collect_msg_elements_body(data.get("msg_elements"))
+        element_text, element_attachments = _collect_msg_elements_body(
+            data.get("msg_elements")
+        )
         if element_attachments:
             attachments = _merge_attachments(attachments, element_attachments)
     group_openid = str(data.get("group_openid") or "") or None
@@ -382,22 +309,20 @@ def parse_incoming(payload: dict[str, Any]) -> IncomingMessage | None:
         str(data.get("content") or "").strip(),
         element_text,
     )
-    quoted_text = _resolve_quoted_text(data, scene_ext, message_type)
+    quoted = resolve_quoted(
+        data,
+        scene_ext,
+        message_type,
+        group_openid=group_openid,
+        user_openid=user_openid,
+    )
     asr_parts = [
         item.asr_refer_text.strip()
         for item in attachments
         if item.asr_refer_text.strip()
     ]
     asr_text = " ".join(asr_parts).strip()
-    _remember_for_quotes(msg_idx, content, asr_text, quoted_text)
-    quotes_bot = _detect_quotes_bot(
-        data,
-        scene_ext,
-        message_type,
-        quoted_text,
-        group_openid=group_openid,
-        user_openid=user_openid,
-    )
+    _remember_for_quotes(msg_idx, content, asr_text)
     return IncomingMessage(
         event_type=event_type,
         event_id=str(payload.get("id") or ""),
@@ -408,9 +333,9 @@ def parse_incoming(payload: dict[str, Any]) -> IncomingMessage | None:
         group_openid=group_openid,
         member_role=_member_role(author),
         quote_id=_quote_id(data, msg_id),
-        ref_msg_idx=scene_ext.get("ref_msg_idx", "").strip(),
-        quoted_text=quoted_text,
-        quotes_bot=quotes_bot,
+        ref_msg_idx=quoted.ref_msg_idx,
+        quoted_text=quoted.text,
+        quotes_bot=quoted.quotes_bot,
         message_type=message_type,
         attachments=attachments,
     )
@@ -425,9 +350,16 @@ def merge_inbound_messages(messages: list[IncomingMessage]) -> IncomingMessage:
     last = messages[-1]
     texts: list[str] = []
     for item in messages:
-        text = item.user_text.strip()
+        text = item.spoken_text.strip()
         if text and (not texts or texts[-1] != text):
             texts.append(text)
+    quoted_text = ""
+    ref_msg_idx = last.ref_msg_idx
+    for item in reversed(messages):
+        if item.quoted_text.strip():
+            quoted_text = item.quoted_text.strip()
+            ref_msg_idx = item.ref_msg_idx
+            break
     attachments: list[Attachment] = []
     seen: set[str] = set()
     for item in messages:
@@ -453,11 +385,9 @@ def merge_inbound_messages(messages: list[IncomingMessage]) -> IncomingMessage:
         username=last.username,
         member_role=last.member_role,
         quote_id=last.quote_id,
-        ref_msg_idx=last.ref_msg_idx,
-        quoted_text=last.quoted_text,
+        ref_msg_idx=ref_msg_idx,
+        quoted_text=quoted_text,
         quotes_bot=quotes_bot,
         message_type=last.message_type,
         attachments=tuple(attachments),
     )
-
-

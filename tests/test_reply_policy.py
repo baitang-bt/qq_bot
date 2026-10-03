@@ -324,3 +324,59 @@ def test_require_and_skip_keywords(tmp_path: Path) -> None:
     assert gate.decide(_c2c("随便聊聊"), now=1.0) == "require_keywords"
     assert gate.decide(_c2c("机器人闭嘴"), now=2.0) == "skip_keywords"
     assert gate.decide(_c2c("机器人你好"), now=20.0) is None
+
+
+def test_speak_mode_all_replies_unmentioned_during_peak(tmp_path: Path) -> None:
+    """all ignores hook and weekday peak so the bot tries every group line."""
+    path = tmp_path / "reply_policy.toml"
+    path.write_text(
+        'speak_mode = "all"\ngroup_unmentioned = true\n'
+        "unmentioned_off_peak_only = true\nunmentioned_need_hook = true\n"
+        "max_per_session_per_minute = 10\n",
+        encoding="utf-8",
+    )
+    gate = ReplyGate(path)
+    peak = datetime(2026, 8, 31, 10, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()
+    assert gate.decide(_group_plain("随便聊聊"), now=peak) is None
+
+
+def test_speak_mode_mention_quote_only(tmp_path: Path) -> None:
+    """mention_quote skips plain group chat but still answers @ and quote-of-bot."""
+    path = tmp_path / "reply_policy.toml"
+    path.write_text(
+        'speak_mode = "mention_quote"\ngroup_unmentioned = true\n'
+        "min_interval_seconds = 0\nmax_per_session_per_minute = 10\n",
+        encoding="utf-8",
+    )
+    gate = ReplyGate(path)
+    assert gate.decide(_group_plain("你好"), now=1.0) == "unmentioned_off"
+    quoted = IncomingMessage(
+        event_type=GROUP_MESSAGE_EVENT,
+        event_id="e4",
+        msg_id="m4",
+        content="接着说",
+        user_openid="user-a",
+        group_openid="group-b",
+        quotes_bot=True,
+    )
+    assert gate.decide(quoted, now=1.0) is None
+    mentioned = IncomingMessage(
+        event_type=GROUP_AT_EVENT,
+        event_id="e5",
+        msg_id="m5",
+        content="在吗",
+        user_openid="user-a",
+        group_openid="group-b",
+    )
+    assert gate.decide(mentioned, now=20.0) is None
+
+
+def test_upsert_speak_mode_replaces_existing_line() -> None:
+    """Console cycle rewrites speak_mode without dropping other toml comments."""
+    from app.reply_policy import next_speak_mode, upsert_speak_mode_text
+
+    text = '# keep me\nspeak_mode = "auto"\nenabled = true\n'
+    updated = upsert_speak_mode_text(text, next_speak_mode("auto"))
+    assert 'speak_mode = "all"' in updated
+    assert "# keep me" in updated
+    assert "enabled = true" in updated

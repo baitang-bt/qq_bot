@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-import io
 import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, TypeAlias
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
-from PIL import Image
 
 from app.config import Settings
 from app.llm.client import StickerTriage
 from app.qq.events import Attachment
+from app.stickers.format import frame_for_model, sniffed_mime
 from app.stickers.library import content_md5, normalize_sticker_id
 from app.vision.cache import ImageCache
 from app.vision.keys import is_sticker, keys_from_attachment, md5_key
@@ -106,7 +106,8 @@ class ImageIdentifier:
                     (attachment.url or "")[:120],
                 )
                 continue
-            out.append((data, mime))
+            frame, frame_mime = frame_for_model(data)
+            out.append((frame, frame_mime))
         return out
 
     async def resolve_sticker_notes(
@@ -160,7 +161,7 @@ class ImageIdentifier:
                 self._cache.put(all_keys, cached, source="backfill")
                 return cached
 
-        triage = await self._run_triage(data, mime)
+        triage = await self._run_triage(*frame_for_model(data))
         desc = (triage.description or "").strip()
         if not desc or desc in _BAD_CACHE_DESCRIPTIONS:
             return desc or _MISS_NOTE
@@ -257,11 +258,12 @@ class ImageIdentifier:
         )
 
     async def _download(self, attachment: Attachment) -> tuple[bytes, str]:
-        """Fetch attachment bytes and normalize GIF/webp to a JPEG first frame."""
+        """Fetch original attachment bytes; mime is sniffed from magic, not flattened."""
         try:
+            url = prefer_original_media_url(attachment.url)
             async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
                 response = await client.get(
-                    attachment.url,
+                    url,
                     headers={"User-Agent": "QQBot"},
                 )
             response.raise_for_status()
@@ -269,25 +271,44 @@ class ImageIdentifier:
         except Exception:
             _log.exception("attachment download failed")
             return b"", "image/jpeg"
-        mime = (attachment.content_type or response.headers.get("content-type") or "image/jpeg")
-        mime = mime.split(";")[0].strip().lower()
-        if mime in {"image/gif", "image/webp"} or attachment.filename.lower().endswith(
-            (".gif", ".webp")
-        ):
-            data, mime = _first_frame_jpeg(data)
-        if mime not in {"image/jpeg", "image/png", "image/jpg"}:
-            data, mime = _first_frame_jpeg(data)
+        mime = sniffed_mime(data)
+        declared = (
+            attachment.content_type or response.headers.get("content-type") or ""
+        )
+        declared = declared.split(";")[0].strip().lower()
+        name = (attachment.filename or "").lower()
+        if (
+            name.endswith((".gif", ".webp")) or declared in {"image/gif", "image/webp"}
+        ) and mime not in {"image/gif", "image/webp"}:
+            _log.warning(
+                "sticker download still after gif/webp hint filename=%s sniffed=%s declared=%s bytes=%s",
+                attachment.filename,
+                mime,
+                declared or "-",
+                len(data),
+            )
+        _log.info(
+            "attachment fetched filename=%s sniffed=%s declared=%s bytes=%s",
+            attachment.filename,
+            mime,
+            declared or "-",
+            len(data),
+        )
         return data, mime
 
 
-def _first_frame_jpeg(data: bytes) -> tuple[bytes, str]:
-    """Convert an animated or exotic image to a single JPEG frame."""
-    try:
-        image = Image.open(io.BytesIO(data))
-        image = image.convert("RGB")
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=85)
-        return buffer.getvalue(), "image/jpeg"
-    except Exception:
-        _log.exception("image convert failed")
-        return data, "image/jpeg"
+def prefer_original_media_url(url: str) -> str:
+    """Rewrite QQ download spec= to 0 so we fetch the original file, not a still thumb."""
+    if not url:
+        return url
+    parts = urlsplit(url)
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    if not any(key.lower() == "spec" for key, _ in pairs):
+        return url
+    rewritten = [
+        ("spec", "0") if key.lower() == "spec" else (key, value)
+        for key, value in pairs
+    ]
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(rewritten), parts.fragment)
+    )

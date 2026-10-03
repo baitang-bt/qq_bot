@@ -29,6 +29,17 @@ fi
 if [[ -f "$UV_PID" ]] && kill -0 "$(cat "$UV_PID")" 2>/dev/null; then
   echo "uvicorn 已在运行 pid=$(cat "$UV_PID")"
 else
+  # pid 文件失效时仍可能有旧 uvicorn 占着 8080，先清掉再启动。
+  if command -v lsof >/dev/null; then
+    for pid in $(lsof -nP -iTCP:8080 -sTCP:LISTEN -t 2>/dev/null); do
+      cmd=$(ps -p "$pid" -o args= 2>/dev/null || true)
+      if [[ "$cmd" == *"app.main:app"* ]]; then
+        kill "$pid" 2>/dev/null || true
+        echo "已结束占用 8080 的旧 uvicorn pid=$pid"
+        sleep 0.4
+      fi
+    done
+  fi
   cd "$ROOT"
   : >"$PID_DIR/uvicorn.log"
   nohup "$PY" -m uvicorn app.main:app --host 127.0.0.1 --port 8080 \

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -44,6 +45,8 @@ def _settings(tmp_path: Path, *, auto_learn: bool = True) -> Settings:
         data_dir=tmp_path,
         reply_policy_path=tmp_path / "reply_policy.toml",
         bot_prompt_path=tmp_path / "bot_prompt.json",
+        personas_dir=tmp_path / "personas",
+        personas_index_path=tmp_path / "personas.toml",
         qq_id="",
         host="127.0.0.1",
         port=8080,
@@ -245,3 +248,142 @@ def test_triage_save_true_learns_and_dual_writes(tmp_path: Path) -> None:
     assert catalog.description_for_md5(digest) == "通用捂脸猫"
     assert "通用捂脸猫" in catalog.prompt_block()
     assert refreshed == ["ok"]
+
+
+def _animated_gif() -> bytes:
+    """Two-frame GIF used as a fake QQ attachment body."""
+    buf = BytesIO()
+    first = Image.new("RGB", (8, 8), (200, 0, 0))
+    second = Image.new("RGB", (8, 8), (0, 200, 0))
+    first.save(
+        buf,
+        format="GIF",
+        save_all=True,
+        append_images=[second],
+        duration=50,
+        loop=0,
+    )
+    return buf.getvalue()
+
+
+def _jpeg_bytes() -> bytes:
+    """Tiny JPEG for still-save tests."""
+    buf = BytesIO()
+    Image.new("RGB", (8, 8), (11, 22, 33)).save(buf, format="JPEG", quality=90)
+    return buf.getvalue()
+
+
+class _GifHttpClient:
+    """httpx.AsyncClient stand-in that returns a GIF regardless of declared type."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __call__(self, *args, **kwargs):
+        """Match AsyncClient(...) construction."""
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def get(self, url, headers=None):
+        """Return the canned GIF with an image/gif content-type header."""
+
+        class _Resp:
+            content = self._body
+            headers = {"content-type": "image/gif"}
+
+            def raise_for_status(self) -> None:
+                return None
+
+        return _Resp()
+
+
+def test_download_does_not_flatten_gif(tmp_path: Path) -> None:
+    """Declared image/gif stays raw GIF8 bytes; fetch_images still sends a PNG frame."""
+    gif = _animated_gif()
+    vision = ImageIdentifier(_settings(tmp_path), None)
+    sticker = Attachment(
+        url="https://x.example/download?fileid=GIFRAW",
+        filename="dance.gif",
+        content_type="image/gif",
+        size=len(gif),
+    )
+    client = _GifHttpClient(gif)
+    with patch("app.vision.identify.httpx.AsyncClient", client):
+        data, mime = asyncio.run(vision._download(sticker))
+        frames = asyncio.run(vision.fetch_images((sticker,)))
+    assert mime == "image/gif"
+    assert data.startswith(b"GIF8")
+    assert data == gif
+    assert frames[0][1] == "image/png"
+    assert frames[0][0].startswith(b"\x89PNG")
+
+
+def test_learn_animated_gif_writes_gif_file(tmp_path: Path) -> None:
+    """Auto-learn persists animation as .gif; triage only sees a still PNG."""
+    gif = _animated_gif()
+    stickers = tmp_path / "stickers"
+    index = tmp_path / "stickers.toml"
+    library = StickerLibrary(stickers, index)
+    catalog = StickerCatalog(index, stickers)
+    triage = AsyncMock(
+        return_value=StickerTriage(
+            description="跳舞小人",
+            save=True,
+            sticker_id="dance_loop",
+            tags=("动图",),
+            reason="通用反应",
+        )
+    )
+    cache = ImageCache(tmp_path / "bot.sqlite3")
+    vision = ImageIdentifier(
+        _settings(tmp_path),
+        cache,
+        triage=triage,
+        library=library,
+        catalog=catalog,
+        auto_learn=True,
+    )
+    sticker = Attachment(
+        url="https://x.example/download?fileid=DANCE",
+        filename="dance.gif",
+        content_type="image/gif",
+        size=len(gif),
+    )
+
+    async def fake_download(_attachment):
+        return gif, "image/gif"
+
+    with patch.object(vision, "_download", side_effect=fake_download):
+        notes = asyncio.run(vision.resolve_sticker_notes((sticker,)))
+
+    assert notes == ["跳舞小人"]
+    payload, mime = triage.await_args.args
+    assert mime == "image/png"
+    assert payload.startswith(b"\x89PNG")
+    dest = stickers / "dance_loop.gif"
+    assert dest.is_file()
+    assert dest.read_bytes().startswith(b"GIF8")
+    assert dest.read_bytes() == gif
+
+
+def test_learn_jpeg_keeps_jpeg(tmp_path: Path) -> None:
+    """True JPEG bytes stay JPEG; we do not transcode to PNG."""
+    jpeg = _jpeg_bytes()
+    stickers = tmp_path / "stickers"
+    index = tmp_path / "stickers.toml"
+    library = StickerLibrary(stickers, index)
+    entry = library.save_sticker(
+        jpeg,
+        "image/jpeg",
+        sticker_id="still_face",
+        description="静态脸",
+    )
+    assert entry is not None
+    assert entry.file.endswith(".jpg")
+    path = stickers / entry.file
+    assert path.read_bytes() == jpeg

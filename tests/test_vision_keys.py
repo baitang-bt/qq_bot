@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 from app.config import Settings
 from app.qq.events import Attachment
 from app.vision.cache import ImageCache
-from app.vision.identify import ImageIdentifier
+from app.vision.identify import ImageIdentifier, prefer_original_media_url
 from app.vision.keys import (
     extract_fileid,
     extract_hex_filename,
@@ -113,6 +113,8 @@ def _settings(tmp_path) -> Settings:
         data_dir=tmp_path,
         reply_policy_path=tmp_path / "reply_policy.toml",
         bot_prompt_path=tmp_path / "bot_prompt.json",
+        personas_dir=tmp_path / "personas",
+        personas_index_path=tmp_path / "personas.toml",
         qq_id="",
         host="127.0.0.1",
         port=8080,
@@ -186,3 +188,12 @@ def test_resolve_sticker_notes_failure_not_cached(tmp_path) -> None:
 
     assert notes == ["图没看清"]
     assert cache.get(["fileid:FID"]) is None
+
+
+def test_prefer_original_media_url_sets_spec_zero() -> None:
+    """QQ thumb spec is rewritten to spec=0 so the original file is fetched."""
+    url = "https://multimedia.nt.qq.com.cn/download?appid=1&fileid=Ab&spec=1&rkey=x"
+    out = prefer_original_media_url(url)
+    assert "spec=0" in out
+    assert "spec=1" not in out
+    assert prefer_original_media_url("https://example.com/a.gif") == "https://example.com/a.gif"

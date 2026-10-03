@@ -26,6 +26,8 @@ def _client(tmp_path: Path) -> LLMClient:
         data_dir=tmp_path,
         reply_policy_path=tmp_path / "reply_policy.toml",
         bot_prompt_path=tmp_path / "bot_prompt.json",
+        personas_dir=tmp_path / "personas",
+        personas_index_path=tmp_path / "personas.toml",
         qq_id="",
         host="127.0.0.1",
         port=8080,

@@ -13,6 +13,13 @@ import httpx
 from app.admin import bot_control
 from app.config import load_settings
 from app.impression.store import ImpressionStore
+from app.personas.catalog import PersonaCatalog
+from app.reply_policy import (
+    load_reply_settings,
+    next_speak_mode,
+    speak_mode_label,
+    upsert_speak_mode_text,
+)
 
 
 @dataclass(frozen=True)
@@ -38,12 +45,151 @@ class AdminUiState:
 
 @dataclass(frozen=True)
 class PromptData:
-    """Editable bot_prompt.json fields."""
+    """Active persona pack as the three reserved txt files (legacy admin API)."""
 
     persona: str
     anti_injection: list[str]
     stay_on_prompt: list[str]
     path: str
+
+
+def _persona_catalog() -> PersonaCatalog:
+    """Build a catalog from current settings (reloads toml and folders)."""
+    settings = load_settings()
+    return PersonaCatalog(
+        settings.personas_index_path,
+        settings.personas_dir,
+        json_migrate_path=settings.bot_prompt_path,
+    )
+
+
+def personas_dir() -> Path:
+    """Return the local persona packs folder."""
+    path = load_settings().personas_dir
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def list_persona_packs() -> list[dict[str, object]]:
+    """List persona packs with active flag and txt filenames."""
+    catalog = _persona_catalog()
+    active = catalog.active_id()
+    rows: list[dict[str, object]] = []
+    for entry in catalog.list_packs():
+        rows.append(
+            {
+                "id": entry.id,
+                "title": entry.title,
+                "active": entry.id == active,
+                "files": catalog.list_files(entry.id),
+                "path": str(entry.path),
+            }
+        )
+    return rows
+
+
+def persona_active_id() -> str:
+    """Return the enabled persona pack id."""
+    return _persona_catalog().active_id()
+
+
+def set_persona_active(persona_id: str) -> str:
+    """Enable one persona pack for the next chat turn."""
+    return _persona_catalog().set_active(persona_id)
+
+
+def list_persona_files(persona_id: str) -> list[str]:
+    """Txt filenames in a pack, reserved files first."""
+    return _persona_catalog().list_files(persona_id)
+
+
+def read_persona_file(persona_id: str, filename: str) -> str:
+    """Read one txt from a pack."""
+    return _persona_catalog().read_file(persona_id, filename)
+
+
+def save_persona_file(persona_id: str, filename: str, text: str) -> Path:
+    """Write one txt in a pack."""
+    return _persona_catalog().save_file(persona_id, filename, text)
+
+
+def add_persona_file(persona_id: str, filename: str) -> Path:
+    """Create an empty txt in a pack."""
+    return _persona_catalog().add_file(persona_id, filename)
+
+
+def new_persona_pack(persona_id: str, title: str = "") -> dict[str, object]:
+    """Create a pack and return its list-row dict."""
+    entry = _persona_catalog().new_pack(persona_id, title)
+    return {
+        "id": entry.id,
+        "title": entry.title,
+        "active": entry.id == persona_active_id(),
+        "files": list_persona_files(entry.id),
+        "path": str(entry.path),
+    }
+
+
+def delete_persona_pack(persona_id: str) -> None:
+    """Delete a non-active pack that is not the last remaining one."""
+    _persona_catalog().delete_pack(persona_id)
+
+
+def read_prompt() -> PromptData:
+    """Load reserved txts of the active pack for the legacy HTTP editor."""
+    catalog = _persona_catalog()
+    pack_id = catalog.active_id()
+    folder = catalog.dir_for(pack_id) if pack_id else None
+    if not pack_id or folder is None:
+        return PromptData("", [], [], str(load_settings().personas_dir))
+    return PromptData(
+        persona=catalog.read_file(pack_id, "persona.txt"),
+        anti_injection=_txt_lines(catalog.read_file(pack_id, "anti_injection.txt")),
+        stay_on_prompt=_txt_lines(catalog.read_file(pack_id, "stay_on_prompt.txt")),
+        path=str(folder),
+    )
+
+
+def save_prompt(persona: str, anti_injection: list[str], stay_on_prompt: list[str]) -> Path:
+    """Write reserved txts of the active pack (legacy HTTP editor)."""
+    catalog = _persona_catalog()
+    pack_id = catalog.active_id()
+    if not pack_id:
+        catalog.new_pack("0x01", "默认")
+        pack_id = "0x01"
+    catalog.save_file(pack_id, "persona.txt", persona.strip() + "\n")
+    catalog.save_file(
+        pack_id,
+        "anti_injection.txt",
+        "\n".join(line.strip() for line in anti_injection if line.strip()) + "\n",
+    )
+    catalog.save_file(
+        pack_id,
+        "stay_on_prompt.txt",
+        "\n".join(line.strip() for line in stay_on_prompt if line.strip()) + "\n",
+    )
+    folder = catalog.dir_for(pack_id)
+    return folder if folder is not None else catalog.save_file(pack_id, "persona.txt", persona)
+
+
+def import_prompt_file(path: Path) -> Path:
+    """Import a bot_prompt.json object into the active pack's reserved txts."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"无法读取 JSON：{exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("人设 JSON 根节点必须是对象")
+    return save_prompt(
+        str(raw.get("persona") or ""),
+        _string_list(raw.get("anti_injection")),
+        _string_list(raw.get("stay_on_prompt")),
+    )
+
+
+def _txt_lines(text: str) -> list[str]:
+    """Split a one-rule-per-line txt into non-empty strings."""
+    return [line.strip() for line in (text or "").splitlines() if line.strip()]
 
 
 def bot_snapshot() -> BotSnapshot:
@@ -73,49 +219,6 @@ def stop_bot() -> BotSnapshot:
     return bot_snapshot()
 
 
-def read_prompt() -> PromptData:
-    """Load bot_prompt.json for editing."""
-    path = load_settings().bot_prompt_path
-    if not path.is_file():
-        return PromptData("", [], [], str(path))
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("bot_prompt.json 根节点必须是对象")
-    return PromptData(
-        persona=str(data.get("persona") or ""),
-        anti_injection=_string_list(data.get("anti_injection")),
-        stay_on_prompt=_string_list(data.get("stay_on_prompt")),
-        path=str(path),
-    )
-
-
-def save_prompt(persona: str, anti_injection: list[str], stay_on_prompt: list[str]) -> Path:
-    """Write bot_prompt.json; hot-reloads on the next chat."""
-    path = load_settings().bot_prompt_path
-    payload = {
-        "persona": persona.strip(),
-        "anti_injection": [line.strip() for line in anti_injection if line.strip()],
-        "stay_on_prompt": [line.strip() for line in stay_on_prompt if line.strip()],
-    }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return path
-
-
-def import_prompt_file(path: Path) -> Path:
-    """Import bot_prompt.json from disk and overwrite the active prompt file."""
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"无法读取 JSON：{exc}") from exc
-    if not isinstance(raw, dict):
-        raise ValueError("bot_prompt.json 根节点必须是对象")
-    return save_prompt(
-        str(raw.get("persona") or ""),
-        _string_list(raw.get("anti_injection")),
-        _string_list(raw.get("stay_on_prompt")),
-    )
-
-
 def read_reply_policy() -> tuple[str, Path]:
     """Load reply_policy.toml text."""
     path = load_settings().reply_policy_path
@@ -129,6 +232,28 @@ def save_reply_policy(text: str) -> Path:
     path = load_settings().reply_policy_path
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def read_speak_mode() -> str:
+    """Return the current group speak mode from reply_policy.toml."""
+    path = load_settings().reply_policy_path
+    return load_reply_settings(path).speak_mode
+
+
+def cycle_speak_mode() -> str:
+    """Advance speak_mode in reply_policy.toml; next inbound message reloads it."""
+    path = load_settings().reply_policy_path
+    text = path.read_text(encoding="utf-8") if path.is_file() else ""
+    current = load_reply_settings(path).speak_mode if path.is_file() else "auto"
+    nxt = next_speak_mode(current)
+    path.write_text(upsert_speak_mode_text(text, nxt), encoding="utf-8")
+    return nxt
+
+
+def speak_mode_button_text(mode: str | None = None) -> str:
+    """Label for the run-tab speak-mode cycle button."""
+    key = mode if mode is not None else read_speak_mode()
+    return f"发言模式：{speak_mode_label(key)}"
 
 
 def read_admin_ui() -> AdminUiState:
@@ -321,6 +446,20 @@ def clear_monitor_logs() -> Path:
 def uvicorn_log_path() -> Path:
     """Return the bot process log file path."""
     return load_settings().data_dir / "uvicorn.log"
+
+
+def stickers_cache_dir() -> Path:
+    """Return the local sticker library folder (learned + manual PNG/JPG)."""
+    path = load_settings().stickers_dir
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def reveal_in_file_manager(path: Path) -> Path:
+    """Open a folder in Finder (macOS). Creates the directory if missing."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["open", str(path)], check=True)
+    return path
 
 
 def _is_monitor_line(line: str) -> bool:
