@@ -151,7 +151,10 @@ def test_library_description_hit_skips_triage(tmp_path: Path) -> None:
     with patch.object(vision, "_download", side_effect=fake_download):
         notes = asyncio.run(vision.resolve_sticker_notes((sticker,)))
 
-    assert notes == ["本地描述缓存 → 可发 [[sticker:facepalm_cat]]"]
+    assert notes.notes == [
+        "本地描述缓存（已入库；对方刚发的这张，本轮不要原样发回去）"
+    ]
+    assert notes.inbound_ids == ("facepalm_cat",)
     triage.assert_not_awaited()
     assert cache.get([f"md5:{hashlib.md5(data).hexdigest()}"]) == "本地描述缓存"
 
@@ -193,7 +196,8 @@ def test_triage_save_false_does_not_write_file(tmp_path: Path) -> None:
     with patch.object(vision, "_download", side_effect=fake_download):
         notes = asyncio.run(vision.resolve_sticker_notes((sticker,)))
 
-    assert notes == ["一次性梗图"]
+    assert notes.notes == ["一次性梗图"]
+    assert notes.inbound_ids == ()
     assert library.learned_count() == 0
     assert list(stickers.glob("*.png")) == []
     assert cache.get(["fileid:FID2"]) == "一次性梗图"
@@ -239,7 +243,10 @@ def test_triage_save_true_learns_and_dual_writes(tmp_path: Path) -> None:
     with patch.object(vision, "_download", side_effect=fake_download):
         notes = asyncio.run(vision.resolve_sticker_notes((sticker,)))
 
-    assert notes == ["通用捂脸猫 → 可发 [[sticker:facepalm_cat]]"]
+    assert notes.notes == [
+        "通用捂脸猫（已入库；对方刚发的这张，本轮不要原样发回去）"
+    ]
+    assert notes.inbound_ids == ("facepalm_cat",)
     assert library.learned_count() == 1
     digest = content_md5(data)
     assert cache.get([f"md5:{digest}"]) == "通用捂脸猫"
@@ -361,7 +368,10 @@ def test_learn_animated_gif_writes_gif_file(tmp_path: Path) -> None:
     with patch.object(vision, "_download", side_effect=fake_download):
         notes = asyncio.run(vision.resolve_sticker_notes((sticker,)))
 
-    assert notes == ["跳舞小人 → 可发 [[sticker:dance_loop]]"]
+    assert notes.notes == [
+        "跳舞小人（已入库；对方刚发的这张，本轮不要原样发回去）"
+    ]
+    assert notes.inbound_ids == ("dance_loop",)
     payload, mime = triage.await_args.args
     assert mime == "image/png"
     assert payload.startswith(b"\x89PNG")
@@ -410,7 +420,10 @@ def test_force_save_learns_when_triage_would_skip(tmp_path: Path) -> None:
         )
 
     assert library.learned_count() == 1
-    assert notes == ["耳机金鱼 → 可发 [[sticker:goldfish_phones]]"]
+    assert notes.notes == [
+        "耳机金鱼（已入库；对方刚发的这张，本轮不要原样发回去）"
+    ]
+    assert notes.inbound_ids == ("goldfish_phones",)
     assert (stickers / "goldfish_phones.png").is_file()
 
 

@@ -15,9 +15,14 @@ from app.config import load_settings
 from app.impression.store import ImpressionStore
 from app.personas.catalog import PersonaCatalog
 from app.reply_policy import (
+    guard_list_to_lines,
+    lines_to_guard_list,
     load_reply_settings,
+    merge_policy_guards,
     next_speak_mode,
+    policy_guard_lists,
     speak_mode_label,
+    strip_policy_guards,
     upsert_speak_mode_text,
 )
 
@@ -39,8 +44,8 @@ class BotSnapshot:
 class AdminUiState:
     """Persisted desktop admin UI preferences."""
 
-    persona_anti_injection_expanded: bool = True
-    persona_stay_on_prompt_expanded: bool = True
+    policy_anti_injection_expanded: bool = True
+    policy_stay_on_prompt_expanded: bool = True
 
 
 @dataclass(frozen=True)
@@ -227,11 +232,32 @@ def read_reply_policy() -> tuple[str, Path]:
     return path.read_text(encoding="utf-8"), path
 
 
+def read_reply_policy_parts() -> tuple[str, str, str]:
+    """Split reply_policy.toml into frequency body, anti lines, and stay lines."""
+    text, _path = read_reply_policy()
+    anti, stay = policy_guard_lists(text)
+    return (
+        strip_policy_guards(text),
+        guard_list_to_lines(anti),
+        guard_list_to_lines(stay),
+    )
+
+
 def save_reply_policy(text: str) -> Path:
     """Write reply_policy.toml."""
     path = load_settings().reply_policy_path
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def save_reply_policy_parts(body: str, anti_text: str, stay_text: str) -> Path:
+    """Merge frequency toml with guard editors and write reply_policy.toml."""
+    merged = merge_policy_guards(
+        body,
+        lines_to_guard_list(anti_text),
+        lines_to_guard_list(stay_text),
+    )
+    return save_reply_policy(merged)
 
 
 def read_speak_mode() -> str:
@@ -267,9 +293,15 @@ def read_admin_ui() -> AdminUiState:
         return AdminUiState()
     if not isinstance(raw, dict):
         return AdminUiState()
+    anti = raw.get("policy_anti_injection_expanded")
+    if anti is None:
+        anti = raw.get("persona_anti_injection_expanded")
+    stay = raw.get("policy_stay_on_prompt_expanded")
+    if stay is None:
+        stay = raw.get("persona_stay_on_prompt_expanded")
     return AdminUiState(
-        persona_anti_injection_expanded=_bool(raw.get("persona_anti_injection_expanded"), True),
-        persona_stay_on_prompt_expanded=_bool(raw.get("persona_stay_on_prompt_expanded"), True),
+        policy_anti_injection_expanded=_bool(anti, True),
+        policy_stay_on_prompt_expanded=_bool(stay, True),
     )
 
 
@@ -278,8 +310,8 @@ def save_admin_ui(state: AdminUiState) -> Path:
     path = _admin_ui_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "persona_anti_injection_expanded": state.persona_anti_injection_expanded,
-        "persona_stay_on_prompt_expanded": state.persona_stay_on_prompt_expanded,
+        "policy_anti_injection_expanded": state.policy_anti_injection_expanded,
+        "policy_stay_on_prompt_expanded": state.policy_stay_on_prompt_expanded,
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return path

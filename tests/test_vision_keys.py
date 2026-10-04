@@ -141,7 +141,7 @@ def test_resolve_sticker_notes_cache_hit_skips_describe(tmp_path) -> None:
         size=1,
     )
     notes = asyncio.run(vision.resolve_sticker_notes((sticker,)))
-    assert notes == ["捂脸猫"]
+    assert notes.notes == ["捂脸猫"]
     describe.assert_not_awaited()
 
 
@@ -163,7 +163,7 @@ def test_resolve_sticker_notes_miss_describes_and_puts(tmp_path) -> None:
     with patch.object(vision, "_download", side_effect=fake_download):
         notes = asyncio.run(vision.resolve_sticker_notes((sticker,)))
 
-    assert notes == ["一只猫在捂脸"]
+    assert notes.notes == ["一只猫在捂脸"]
     describe.assert_awaited_once()
     assert cache.get(["fileid:FID"]) == "一只猫在捂脸"
 
@@ -186,7 +186,7 @@ def test_resolve_sticker_notes_failure_not_cached(tmp_path) -> None:
     with patch.object(vision, "_download", side_effect=fake_download):
         notes = asyncio.run(vision.resolve_sticker_notes((sticker,)))
 
-    assert notes == ["图没看清"]
+    assert notes.notes == ["图没看清"]
     assert cache.get(["fileid:FID"]) is None
 
 

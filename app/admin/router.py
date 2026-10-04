@@ -49,9 +49,11 @@ class PersonaNewFileBody(BaseModel):
 
 
 class ReplyPolicyBody(BaseModel):
-    """Raw reply_policy.toml text."""
+    """Frequency toml body, optionally with separate guard editors."""
 
-    text: str
+    text: str = ""
+    anti_injection: str | None = None
+    stay_on_prompt: str | None = None
 
 
 class ImpressionBody(BaseModel):
@@ -216,14 +218,27 @@ def create_router() -> APIRouter:
 
     @router.get("/admin/api/reply-policy")
     def get_reply_policy() -> dict[str, str]:
-        """Read reply_policy.toml as text."""
-        text, path = store.read_reply_policy()
-        return {"text": text, "path": str(path)}
+        """Read frequency body plus anti-injection / stay-on-prompt editors."""
+        body, anti, stay = store.read_reply_policy_parts()
+        _text, path = store.read_reply_policy()
+        return {
+            "text": body,
+            "anti_injection": anti,
+            "stay_on_prompt": stay,
+            "path": str(path),
+        }
 
     @router.put("/admin/api/reply-policy")
     def put_reply_policy(body: ReplyPolicyBody) -> dict[str, str]:
-        """Write reply_policy.toml."""
-        path = store.save_reply_policy(body.text)
+        """Write reply_policy.toml from parts, or raw text when guards are omitted."""
+        if body.anti_injection is not None or body.stay_on_prompt is not None:
+            path = store.save_reply_policy_parts(
+                body.text,
+                body.anti_injection or "",
+                body.stay_on_prompt or "",
+            )
+        else:
+            path = store.save_reply_policy(body.text)
         return {"ok": "saved", "path": str(path)}
 
     @router.get("/admin/api/impressions")

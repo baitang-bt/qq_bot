@@ -30,3 +30,27 @@ file = "s_3bcdfa3dc4.gif"
 md5 = "3bcdfa3dc4dd6781003e21174fda706c"
 description = "一只像素风橙色金鱼戴着黑色耳机，背景为纯橙色，画面简洁可爱，带有呆萌、专注听歌的情绪。"
 source = "learned"
+
+[[sticker]]
+id = "pixel_attack_helicopter"
+file = "pixel_attack_helicopter.gif"
+tags = ["像素", "直升机", "军事", "简笔画", "梗图"]
+md5 = "23400ce15ee521412314c655f3dc8a02"
+description = "像素风格的武装直升机简笔画，黑底白线，带有一种复古游戏或军事梗的冷幽默感。"
+source = "learned"
+
+[[sticker]]
+id = "dog_water_bucket"
+file = "dog_water_bucket.jpg"
+tags = ["狗头", "灌水", "懵", "无奈", "表情包"]
+md5 = "95ae4c0ce8a8b5dc70791ba57bf84c10"
+description = "一只狗头表情包，头顶被倒置的蓝色水桶灌水，狗头眼神呆滞、嘴角流口水，表现出被灌懵或无奈的情绪。"
+source = "learned"
+
+[[sticker]]
+id = "doge_question_mark"
+file = "doge_question_mark.jpg"
+tags = ["柴犬", "问号", "疑惑", "懵逼"]
+md5 = "1f1a8ecb0ab06aba543fbd7b10a8e87a"
+description = "一只柴犬侧脸配黑色问号，表情困惑茫然，表达疑惑不解的情绪。"
+source = "learned"

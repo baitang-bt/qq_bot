@@ -16,10 +16,16 @@ from app.impression.writer import ImpressionWriter
 from app.llm.client import LLMClient
 from app.memory.store import MemoryStore
 from app.qq.events import IncomingMessage
+from app.qq.mentions import display_name, rewrite_mentions
 from app.qq.reply import ReplyClient, should_quote_inbound
+from app.qq.roster import MemberRoster
 from app.reply_policy import ReplyGate
 from app.stickers.catalog import StickerCatalog
-from app.stickers.markers import memory_text_for_segments, parse_reply_segments
+from app.stickers.markers import (
+    drop_echoed_stickers,
+    memory_text_for_segments,
+    parse_reply_segments,
+)
 from app.vision.identify import ImageIdentifier
 
 _log = logging.getLogger(__name__)
@@ -46,6 +52,7 @@ class ChatBot:
         commands: CommandRouter,
         settings: Settings | None = None,
         stickers: StickerCatalog | None = None,
+        roster: MemberRoster | None = None,
     ) -> None:
         self._replies = replies
         self._llm = llm
@@ -56,6 +63,12 @@ class ChatBot:
         self._impression_writer = impression_writer
         self._commands = commands
         self._stickers = stickers
+        if roster is not None:
+            self._roster = roster
+        elif settings is not None:
+            self._roster = MemberRoster(settings.data_dir / "member_names.json")
+        else:
+            self._roster = None
         burst = 30.0 if settings is None else settings.coalesce_burst_seconds
         debounce = 3.0 if settings is None else settings.coalesce_debounce_seconds
         single = 3.0 if settings is None else settings.coalesce_single_debounce_seconds
@@ -94,6 +107,7 @@ class ChatBot:
             message.user_text[:80],
             len(message.image_attachments),
         )
+        self._note_roster(message)
         if not message.is_group:
             try:
                 await self._replies.send_c2c_typing(message, seconds=20)
@@ -152,6 +166,7 @@ class ChatBot:
         history = self._memory.history(message.session_id)
         quote_inbound = should_quote_inbound(history)
         sticker_notes: list[str] = []
+        inbound_sticker_ids: set[str] = set()
         image_bytes: list[tuple[bytes, str]] = []
         if image_attachments or quoted_images:
             stickers, photos = self._vision.partition(image_attachments)
@@ -171,10 +186,12 @@ class ChatBot:
                 except Exception:
                     _log.warning("c2c typing before media failed", exc_info=True)
             if stickers:
-                sticker_notes = await self._vision.resolve_sticker_notes(
+                batch = await self._vision.resolve_sticker_notes(
                     stickers,
                     force_save=_user_asks_to_save_sticker(user_text),
                 )
+                sticker_notes = list(batch.notes)
+                inbound_sticker_ids = set(batch.inbound_ids)
             if photos:
                 image_bytes = await self._vision.fetch_images(photos)
                 _log.info(
@@ -200,6 +217,17 @@ class ChatBot:
             username=message.username,
             spoken_qq=spoken_qq,
         )
+        user_text = self._prepare_user_text(message, user_text)
+        speaker = self._resolve_name(message.user_openid, message.username)
+        directory = self._impressions.directory_block(speaker_name=speaker)
+        others = self._impressions.others_block(exclude_openid=message.user_openid)
+        _log.info(
+            "impression directory n=%s others=%s speaker=%s preview=%r",
+            directory.count("\n- "),
+            others.count("【印象·"),
+            speaker,
+            user_text[:80],
+        )
         if self._stickers is not None:
             self._llm.set_stickers_prompt(self._stickers.prompt_block())
         reply = await self._llm.complete(
@@ -208,6 +236,8 @@ class ChatBot:
             images=image_bytes,
             notes=sticker_notes,
             impression=str(profile.get("impression") or ""),
+            directory=directory,
+            others=others,
         )
         if not reply.strip():
             _log.warning("empty llm reply session=%s", message.session_id)
@@ -223,16 +253,29 @@ class ChatBot:
             user_record = f"{user_record}\n{marker}".strip() if user_record else marker
         known = set(self._stickers.known_ids()) if self._stickers else set()
         segments = parse_reply_segments(reply, known_ids=known)
-        assistant_record = memory_text_for_segments(segments) or reply
+        if inbound_sticker_ids and not _user_asks_to_send_sticker(message.user_text):
+            segments = drop_echoed_stickers(segments, inbound_sticker_ids)
+        assistant_record = memory_text_for_segments(segments)
+        if not assistant_record.strip():
+            assistant_record = "" if inbound_sticker_ids else reply
         self._memory.append(message.session_id, "user", user_record)
-        self._memory.append(message.session_id, "assistant", assistant_record)
+        if assistant_record.strip():
+            self._memory.append(message.session_id, "assistant", assistant_record)
+        if not segments:
+            _log.info(
+                "skip send after inbound sticker echo filter session=%s",
+                message.session_id,
+            )
+            return
         elapsed = time.monotonic() - turn_started
+        sticker_n = sum(1 for seg in segments if getattr(seg, "sticker_id", None))
         _log.info(
-            "正在发送 mentioned=%s segments=%s elapsed=%.1fs preview=%r",
+            "正在发送 mentioned=%s segments=%s stickers=%s elapsed=%.1fs preview=%r",
             message.mentioned,
             len(segments),
+            sticker_n,
             elapsed,
-            reply[:80],
+            assistant_record[:80],
         )
         delivered = await self._replies.send_segments(
             message,
@@ -291,6 +334,40 @@ class ChatBot:
         except Exception:
             _log.exception("impression after_turn failed openid=%s", user_openid)
 
+    def _note_roster(self, message: IncomingMessage) -> None:
+        """Record inbound nicknames (author + payload mentions) before reply-policy skip."""
+        if self._roster is None:
+            return
+        self._roster.note(message.user_openid, message.username)
+        for openid, username in message.mention_names:
+            self._roster.note(openid, username)
+
+    def _resolve_name(self, openid: str, fallback_username: str = "") -> str:
+        """Resolve a display name from impression, then roster, then unknown short id."""
+        impression_name = ""
+        record = self._impressions.load(openid)
+        if isinstance(record, dict):
+            impression_name = str(record.get("username") or "")
+        roster_name = self._roster.lookup(openid) if self._roster is not None else ""
+        return display_name(
+            openid,
+            impression_name or (fallback_username or "").strip(),
+            roster_name,
+        )
+
+    def _prepare_user_text(self, message: IncomingMessage, user_text: str) -> str:
+        """Rewrite `<@id>` to `@昵称` and label the group speaker for the model."""
+        rewritten = rewrite_mentions(
+            user_text,
+            lambda oid: self._resolve_name(oid),
+        )
+        if not message.is_group:
+            return rewritten
+        speaker = self._resolve_name(message.user_openid, message.username)
+        if rewritten.strip():
+            return f"[群友] {speaker}\n{rewritten}"
+        return f"[群友] {speaker}"
+
 
 _SAVE_STICKER_HINTS = (
     "存一下",
@@ -306,6 +383,20 @@ _SAVE_STICKER_HINTS = (
 )
 
 
+_SEND_STICKER_HINTS = (
+    "发这个表情",
+    "发出来",
+    "发出去",
+    "发回来",
+    "把这个表情发",
+)
+
+
 def _user_asks_to_save_sticker(text: str) -> bool:
     """True when the user asked to keep/send the current or quoted sticker."""
     return any(hint in text for hint in _SAVE_STICKER_HINTS)
+
+
+def _user_asks_to_send_sticker(text: str) -> bool:
+    """True when the user explicitly asked to send the inbound/quoted sticker back."""
+    return any(hint in text for hint in _SEND_STICKER_HINTS)

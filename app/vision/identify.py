@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeAlias
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -37,6 +38,14 @@ _BAD_CACHE_DESCRIPTIONS = frozenset(
     }
 )
 _MISS_NOTE = "图没看清"
+
+
+@dataclass(frozen=True)
+class StickerNotes:
+    """Inbound sticker descriptions plus catalog ids to avoid echoing this turn."""
+
+    notes: list[str]
+    inbound_ids: tuple[str, ...] = ()
 
 
 class ImageIdentifier:
@@ -115,28 +124,33 @@ class ImageIdentifier:
         attachments: tuple[Attachment, ...],
         *,
         force_save: bool = False,
-    ) -> list[str]:
+    ) -> StickerNotes:
         """Return sticker descriptions: cache/library hit skips vision; miss triages."""
         notes: list[str] = []
+        inbound_ids: list[str] = []
         for attachment in attachments:
-            note = await self._resolve_one_sticker(attachment, force_save=force_save)
+            note, sticker_id = await self._resolve_one_sticker(
+                attachment, force_save=force_save
+            )
             if note:
                 notes.append(note)
-        return notes
+            if sticker_id:
+                inbound_ids.append(sticker_id)
+        return StickerNotes(notes=notes, inbound_ids=tuple(inbound_ids))
 
     async def _resolve_one_sticker(
         self,
         attachment: Attachment,
         *,
         force_save: bool = False,
-    ) -> str:
+    ) -> tuple[str, str]:
         """Resolve one sticker: library/catalog → image_cache → triage → optional learn."""
         keys = keys_from_attachment(attachment)
         if not force_save and self._cache is not None and keys:
             cached = self._cache.get(keys)
             if cached:
                 _log.info("sticker cache hit keys=%s", keys[:2])
-                return cached
+                return cached, ""
 
         data, mime = await self._download(attachment)
         if not data:
@@ -145,7 +159,7 @@ class ImageIdentifier:
                 attachment.filename,
                 (attachment.url or "")[:120],
             )
-            return _MISS_NOTE
+            return _MISS_NOTE, ""
 
         digest = content_md5(data)
         local_desc = self._local_description(digest)
@@ -181,7 +195,7 @@ class ImageIdentifier:
             triage = await self._run_triage(*frame_for_model(data))
             desc = (triage.description or "").strip()
             if not desc or desc in _BAD_CACHE_DESCRIPTIONS:
-                return desc or _MISS_NOTE
+                return desc or _MISS_NOTE, ""
 
         if self._cache is not None and all_keys:
             self._cache.put(all_keys, desc, source="vision")
@@ -197,16 +211,19 @@ class ImageIdentifier:
 
         return self._note_with_marker(digest, desc)
 
-    def _note_with_marker(self, digest: str, desc: str) -> str:
-        """Append a sendable [[sticker:id]] when this image is already in the library."""
+    def _note_with_marker(self, digest: str, desc: str) -> tuple[str, str]:
+        """Describe the inbound sticker; never attach a send-now [[sticker:id]] marker."""
         sticker_id = ""
         if self._catalog is not None:
             sticker_id = self._catalog.id_for_md5(digest)
         if not sticker_id and self._library is not None:
             sticker_id = self._library.id_for_md5(digest)
         if sticker_id:
-            return f"{desc} → 可发 [[sticker:{sticker_id}]]"
-        return desc
+            return (
+                f"{desc}（已入库；对方刚发的这张，本轮不要原样发回去）",
+                sticker_id,
+            )
+        return desc, ""
 
     def _already_saved(self, digest: str) -> bool:
         """True when catalog or library already has this content hash."""

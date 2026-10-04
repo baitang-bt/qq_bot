@@ -40,6 +40,7 @@ def test_catalog_loads_existing_file(tmp_path: Path) -> None:
     block = catalog.prompt_block()
     assert "[[sticker:facepalm]]" in block
     assert "一只猫捂脸" in block
+    assert "不要把对方刚发的那张原样打回去" in block
 
 
 def test_catalog_skips_missing_file(tmp_path: Path) -> None:
@@ -133,3 +134,32 @@ def test_parse_reply_segments_with_bubble_split() -> None:
         StickerSeg(sticker_id="facepalm"),
         TextSeg(text="第二句"),
     ]
+
+
+def test_parse_reply_segments_accepts_memory_form() -> None:
+    """Models copying [发送表情:id] from history still become sticker segments."""
+    from app.stickers.markers import memory_text_for_segments
+
+    segs = parse_reply_segments(
+        "[发送表情:pixel_attack_helicopter]\n这个也收了",
+        known_ids={"pixel_attack_helicopter"},
+    )
+    assert segs == [
+        StickerSeg(sticker_id="pixel_attack_helicopter"),
+        TextSeg(text="这个也收了"),
+    ]
+    assert memory_text_for_segments(segs) == (
+        "[[sticker:pixel_attack_helicopter]]\n这个也收了"
+    )
+
+
+def test_drop_echoed_stickers_removes_inbound_copy() -> None:
+    """Outbound copy of this turn's inbound sticker is stripped."""
+    from app.stickers.markers import drop_echoed_stickers
+
+    segs = parse_reply_segments(
+        "嗯 [[sticker:confused]]",
+        known_ids={"confused", "facepalm"},
+    )
+    dropped = drop_echoed_stickers(segs, {"confused"})
+    assert dropped == [TextSeg(text="嗯")]

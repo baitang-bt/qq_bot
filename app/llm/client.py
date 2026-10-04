@@ -185,6 +185,8 @@ class LLMClient:
         images: list[tuple[bytes, str]] | None = None,
         notes: list[str] | None = None,
         impression: str = "",
+        directory: str = "",
+        others: str = "",
     ) -> str:
         """Generate a reply; photos may be multimodal, stickers arrive as text notes."""
         image_list = list(images or ())
@@ -222,6 +224,8 @@ class LLMClient:
         system = self._prompts.system_text(
             impression,
             stickers_block=self._stickers_prompt,
+            directory=directory,
+            others=others,
         )
         messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         messages.extend(history)

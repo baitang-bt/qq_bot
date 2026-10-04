@@ -109,6 +109,26 @@ QLabel[role="accent"] {
 QSplitter::handle {
     background: #505050;
 }
+QScrollArea {
+    background-color: #2d2d2d;
+    border: none;
+}
+QScrollBar:vertical {
+    background: #2d2d2d;
+    width: 12px;
+    margin: 0;
+}
+QScrollBar::handle:vertical {
+    background: #555555;
+    min-height: 24px;
+    border-radius: 4px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #666666;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
 """
 
 

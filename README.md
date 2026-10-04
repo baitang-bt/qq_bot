@@ -123,8 +123,8 @@ description = "一只猫捂脸，无奈"
 
 清单在仓库根 `personas.toml`（`active` 指定当前启用的一套），正文在 `data/personas/<id>/*.txt`（与表情包一样不进 git）。仓库里有一套示范：`examples/personas/0x01/`（旧 `bot_prompt.json` 拆成的 txt）。每套文件夹可放多个 txt：
 
-- `persona.txt` — 主口吻
-- `anti_injection.txt` / `stay_on_prompt.txt` — 防注入与不得脱离人设（控制台可编；线上守卫以 `reply_policy.toml` 为准）
+- `persona.txt` — 主口吻与说话风格（不含发/存表情规则）
+- `anti_injection.txt` / `stay_on_prompt.txt` — 备份用；**线上守卫以 `reply_policy.toml` 为准**（表情能力也写在策略里，属 bot 层而非人设）
 - 其它 `.txt` 按文件名排序，以 `【文件名】` 作为块标题
 
 控制台「人设」页：左侧点选只用于编辑，点「启用」才切换线上口吻（下一条消息生效）；「打开人设」会在访达打开 `data/personas`。首次若还没有 `0x01/persona.txt`，会把旧的 `bot_prompt.json` 拆进 `data/personas/0x01/`。路径可用 `PERSONAS_DIR`、`PERSONAS_INDEX_PATH` 覆盖。
@@ -143,7 +143,7 @@ description = "一只猫捂脸，无奈"
 - `group_unmentioned`：自动模式下是否处理未 @ 的群消息
 - `bot_names`：话里出现这些名字时，可视为在叫机器人
 - `unmentioned_off_peak_only`：自动模式下为 true 时，工作日白天拦截未 @ 且未引用机器人的群消息
-- `anti_injection` / `stay_on_prompt`：系统提示里的防注入与不得脱离人设，每条一行
+- `anti_injection` / `stay_on_prompt`：系统提示里的防注入与不得脱离人设，每条一行。控制台「回复策略」页有独立编辑块，不必在整份 toml 里翻
 
 ## 测试
 

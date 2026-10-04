@@ -84,6 +84,63 @@ class ImpressionStore:
                 records.append(_normalize(str(data.get("user_openid") or path.stem), data))
         return records
 
+    def filled_records(self) -> list[dict[str, Any]]:
+        """Return impression files that actually have body text."""
+        filled: list[dict[str, Any]] = []
+        for record in self.list_records():
+            if str(record.get("impression") or "").strip():
+                filled.append(record)
+        return filled
+
+    def directory_label(self, record: dict[str, Any]) -> str:
+        """Format one impression row as a roster line (nickname, optional QQ, or short id)."""
+        username = str(record.get("username") or "").strip()
+        qq = str(record.get("qq") or "").strip()
+        user_openid = str(record.get("user_openid") or "").strip()
+        if username and qq:
+            return f"{username}（QQ {qq}）"
+        if username:
+            return username
+        short = user_openid[:8] if user_openid else "?"
+        return f"（无昵称）{short}"
+
+    def directory_block(self, speaker_name: str = "") -> str:
+        """Compact roster of files that have impression text."""
+        filled = self.filled_records()
+        lines = [
+            f"【已知印象】共 {len(filled)} 份"
+            "（按昵称对应；问有几份、是谁时按本名单如实说，"
+            "不要用聊天记录里的旧说法顶替。"
+            "其他人的正文在下面【印象·昵称】段，评价时用那些内容。）"
+        ]
+        for record in filled:
+            lines.append(f"- {self.directory_label(record)}")
+        speaker = (speaker_name or "").strip()
+        if speaker:
+            lines.append(f"本轮说话的是：{speaker}")
+        return "\n".join(lines)
+
+    def others_block(self, exclude_openid: str = "") -> str:
+        """Full impression bodies for roster members other than the current speaker."""
+        skip = (exclude_openid or "").strip()
+        chunks: list[str] = []
+        for record in self.filled_records():
+            oid = str(record.get("user_openid") or "").strip()
+            if skip and oid == skip:
+                continue
+            body = str(record.get("impression") or "").strip()
+            if not body:
+                continue
+            label = self.directory_label(record)
+            chunks.append(f"【印象·{label}】\n{body}")
+        if not chunks:
+            return ""
+        header = (
+            "【其他人的印象正文】评价、对比、提起某人时用对应档；"
+            "不要串到当前说话人身上，也不要把全文逐字念给群友。"
+        )
+        return header + "\n\n" + "\n\n".join(chunks)
+
     def find_by_username(self, username: str) -> list[dict[str, Any]]:
         """Return impression records whose username matches (case-insensitive)."""
         needle = username.strip().casefold()

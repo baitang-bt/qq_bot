@@ -207,8 +207,13 @@
     </section>
 
     <section class="panel" id="panel-policy">
-      <label>reply_policy.toml</label>
-      <textarea id="policy" style="min-height:320px;font-family:ui-monospace,monospace;font-size:0.85rem"></textarea>
+      <p class="hint">上方改回复开关与频率；下方两块写入系统提示的防注入 / 不得脱离人设。保存后下一条消息生效。</p>
+      <label>回复开关与频率（reply_policy.toml）</label>
+      <textarea id="policy" style="min-height:220px;font-family:ui-monospace,monospace;font-size:0.85rem"></textarea>
+      <label>防注入（每行一条）</label>
+      <textarea id="policy-anti" style="min-height:120px"></textarea>
+      <label>不得脱离人设（每行一条）</label>
+      <textarea id="policy-stay" style="min-height:120px"></textarea>
       <div class="row" style="margin-top:12px">
         <button class="action primary" id="btn-save-policy">保存策略</button>
       </div>
@@ -296,6 +301,8 @@
     async function loadPolicy() {
       const p = await api("/admin/api/reply-policy");
       $("policy").value = p.text || "";
+      $("policy-anti").value = p.anti_injection || "";
+      $("policy-stay").value = p.stay_on_prompt || "";
     }
 
     function renderImpressions(filter) {
@@ -351,8 +358,17 @@
       toast("人设已保存");
     };
     $("btn-save-policy").onclick = async () => {
-      await api("/admin/api/reply-policy", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: $("policy").value }) });
+      await api("/admin/api/reply-policy", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: $("policy").value,
+          anti_injection: $("policy-anti").value,
+          stay_on_prompt: $("policy-stay").value,
+        }),
+      });
       toast("策略已保存");
+      await loadPolicy();
     };
     $("btn-save-imp").onclick = async () => {
       const openid = $("imp-openid").value.trim();

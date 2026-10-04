@@ -137,6 +137,71 @@ def upsert_speak_mode_text(text: str, mode: str) -> str:
     )
 
 
+def policy_guard_lists(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Read anti_injection / stay_on_prompt from raw reply_policy.toml text."""
+    raw = text or ""
+    if not raw.strip():
+        return (), ()
+    try:
+        data = tomllib.loads(raw)
+    except tomllib.TOMLDecodeError:
+        return (), ()
+    if not isinstance(data, dict):
+        return (), ()
+    return (
+        _string_tuple(data.get("anti_injection")),
+        _string_tuple(data.get("stay_on_prompt")),
+    )
+
+
+def strip_policy_guards(text: str) -> str:
+    """Remove anti_injection / stay_on_prompt arrays (and their nearby comments)."""
+    body = text or ""
+    for key in ("anti_injection", "stay_on_prompt"):
+        body = _remove_toml_array(body, key)
+    return body.rstrip() + ("\n" if body.strip() else "")
+
+
+def merge_policy_guards(
+    body: str,
+    anti_injection: tuple[str, ...] | list[str],
+    stay_on_prompt: tuple[str, ...] | list[str],
+) -> str:
+    """Append guard arrays to a switch/frequency body for reply_policy.toml."""
+    clean = strip_policy_guards(body).rstrip()
+    anti = tuple(str(item).strip() for item in anti_injection if str(item).strip())
+    stay = tuple(str(item).strip() for item in stay_on_prompt if str(item).strip())
+    blocks = [
+        _format_string_array(
+            "anti_injection",
+            anti,
+            comment="# 系统提示：防注入。保存后下一条消息生效。",
+        ),
+        _format_string_array(
+            "stay_on_prompt",
+            stay,
+            comment="# 系统提示：平台规则与 bot 能力（在人设之前注入）。保存后下一条消息生效。",
+        ),
+    ]
+    if not clean:
+        return "\n\n".join(blocks) + "\n"
+    return clean + "\n\n" + "\n\n".join(blocks) + "\n"
+
+
+def lines_to_guard_list(text: str) -> tuple[str, ...]:
+    """Split a multiline editor buffer into non-empty guard rules."""
+    return tuple(
+        line.strip()
+        for line in (text or "").replace("\r\n", "\n").split("\n")
+        if line.strip()
+    )
+
+
+def guard_list_to_lines(items: tuple[str, ...] | list[str]) -> str:
+    """Join guard rules for a plain-text editor (one rule per line)."""
+    return "\n".join(str(item).strip() for item in items if str(item).strip())
+
+
 def prompt_guard_chunks(
     anti_injection: tuple[str, ...],
     stay_on_prompt: tuple[str, ...],
@@ -171,6 +236,87 @@ def _string_tuple(value: object) -> tuple[str, ...]:
     if not isinstance(value, list):
         return ()
     return tuple(str(item).strip() for item in value if str(item).strip())
+
+
+def _format_string_array(
+    key: str,
+    items: tuple[str, ...],
+    *,
+    comment: str = "",
+) -> str:
+    """Render a TOML string array, escaping quotes and backslashes."""
+    lines: list[str] = []
+    if comment:
+        lines.append(comment)
+    if not items:
+        lines.append(f"{key} = []")
+        return "\n".join(lines)
+    lines.append(f"{key} = [")
+    for item in items:
+        escaped = item.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'  "{escaped}",')
+    lines.append("]")
+    return "\n".join(lines)
+
+
+def _remove_toml_array(text: str, key: str) -> str:
+    """Delete one top-level `key = [...]` assignment, keeping other comments."""
+    match = re.search(rf"(?m)^[ \t]*{re.escape(key)}[ \t]*=[ \t]*\[", text)
+    if not match:
+        return text
+    start = match.start()
+    # Drop immediately preceding blank/comment lines that belong to this block.
+    prefix = text[:start]
+    while True:
+        cut = prefix.rstrip("\n")
+        if not cut:
+            start = 0
+            break
+        line_start = cut.rfind("\n") + 1
+        line = cut[line_start:]
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith("#"):
+            prefix = cut[:line_start]
+            start = line_start
+            continue
+        break
+    end = _toml_array_end(text, match.end() - 1)
+    if end < 0:
+        return text
+    while end < len(text) and text[end] in " \t":
+        end += 1
+    if end < len(text) and text[end] == "\n":
+        end += 1
+    return text[:start] + text[end:]
+
+
+def _toml_array_end(text: str, open_bracket: int) -> int:
+    """Return index after the matching ']' for a TOML array, or -1."""
+    depth = 0
+    i = open_bracket
+    in_str = False
+    escape = False
+    while i < len(text):
+        ch = text[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
 
 
 class ReplyGate:

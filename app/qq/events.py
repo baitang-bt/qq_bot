@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.qq import message_cache
+from app.qq.mentions import mention_pairs_from_payload
 from app.qq.quote import resolve_quoted
 
 C2C_EVENT = "C2C_MESSAGE_CREATE"
@@ -45,6 +46,7 @@ class IncomingMessage:
     message_type: int = 0
     attachments: tuple[Attachment, ...] = field(default_factory=tuple)
     quoted_attachments: tuple[Attachment, ...] = field(default_factory=tuple)
+    mention_names: tuple[tuple[str, str], ...] = field(default_factory=tuple)
 
     @property
     def is_group(self) -> bool:
@@ -351,7 +353,21 @@ def parse_incoming(payload: dict[str, Any]) -> IncomingMessage | None:
         message_type=message_type,
         attachments=attachments,
         quoted_attachments=quoted_attachments,
+        mention_names=mention_pairs_from_payload(data),
     )
+
+
+def _merge_mention_names(messages: list[IncomingMessage]) -> tuple[tuple[str, str], ...]:
+    """Union mention (openid, username) pairs across a coalesced burst."""
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for item in messages:
+        for oid, name in item.mention_names:
+            if oid in seen:
+                continue
+            seen.add(oid)
+            out.append((oid, name))
+    return tuple(out)
 
 
 def merge_inbound_messages(messages: list[IncomingMessage]) -> IncomingMessage:
@@ -414,4 +430,5 @@ def merge_inbound_messages(messages: list[IncomingMessage]) -> IncomingMessage:
         message_type=last.message_type,
         attachments=tuple(attachments),
         quoted_attachments=tuple(quoted_attachments),
+        mention_names=_merge_mention_names(messages),
     )

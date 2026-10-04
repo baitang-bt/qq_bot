@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 from app.bot import ChatBot
 from app.qq.events import GROUP_AT_EVENT, Attachment, IncomingMessage
 from app.stickers.catalog import StickerCatalog
+from app.vision.identify import StickerNotes
 
 
 def _group_message(
@@ -60,6 +61,9 @@ def _bot(
 
     impressions = MagicMock()
     impressions.touch = MagicMock(return_value={"impression": ""})
+    impressions.load = MagicMock(return_value={"username": "", "impression": ""})
+    impressions.directory_block = MagicMock(return_value="")
+    impressions.others_block = MagicMock(return_value="")
 
     impression_writer = MagicMock()
     impression_writer.maybe_rewrite = AsyncMock()
@@ -125,7 +129,9 @@ def test_handle_turn_sticker_uses_notes_not_images(caplog, tmp_path: Path) -> No
     vision = MagicMock()
     vision.partition = MagicMock(return_value=((sticker,), ()))
     vision.fetch_images = AsyncMock(return_value=[])
-    vision.resolve_sticker_notes = AsyncMock(return_value=["一只猫在捂脸"])
+    vision.resolve_sticker_notes = AsyncMock(
+        return_value=StickerNotes(notes=["一只猫在捂脸"], inbound_ids=())
+    )
 
     llm = MagicMock()
     llm.complete = AsyncMock(return_value="哈哈哈这表情")
@@ -142,7 +148,7 @@ def test_handle_turn_sticker_uses_notes_not_images(caplog, tmp_path: Path) -> No
     assert kwargs["images"] == []
     assert kwargs["notes"] == ["一只猫在捂脸"]
     bot._test_memory.append.assert_any_call(  # type: ignore[attr-defined]
-        message.session_id, "user", "[表情包] 一只猫在捂脸"
+        message.session_id, "user", "[群友] 未知(user-a)\n[表情包] 一只猫在捂脸"
     )
 
 
@@ -180,7 +186,7 @@ def test_handle_turn_outbound_sticker_marker(tmp_path: Path) -> None:
     segments = args.args[1]
     assert any(getattr(seg, "sticker_id", None) == "facepalm" for seg in segments)
     bot._test_memory.append.assert_any_call(  # type: ignore[attr-defined]
-        message.session_id, "assistant", "无奈\n[发送表情:facepalm]"
+        message.session_id, "assistant", "无奈\n[[sticker:facepalm]]"
     )
 
 
@@ -198,7 +204,10 @@ def test_handle_turn_quoted_sticker_asks_to_save(tmp_path: Path) -> None:
     )
     vision.fetch_images = AsyncMock(return_value=[])
     vision.resolve_sticker_notes = AsyncMock(
-        return_value=["耳机金鱼 → 可发 [[sticker:goldfish_phones]]"]
+        return_value=StickerNotes(
+            notes=["耳机金鱼（已入库；对方刚发的这张，本轮不要原样发回去）"],
+            inbound_ids=("goldfish_phones",),
+        )
     )
     llm = MagicMock()
     llm.complete = AsyncMock(return_value="好 [[sticker:goldfish_phones]]")
@@ -218,3 +227,47 @@ def test_handle_turn_quoted_sticker_asks_to_save(tmp_path: Path) -> None:
     args, kwargs = vision.resolve_sticker_notes.await_args
     assert args[0] == (quoted,)
     assert kwargs["force_save"] is True
+
+
+def test_handle_turn_does_not_echo_inbound_sticker(tmp_path: Path) -> None:
+    """Copying the user's just-sent sticker is dropped unless they asked to send it."""
+    stickers_dir = tmp_path / "stickers"
+    stickers_dir.mkdir()
+    png = stickers_dir / "confused.png"
+    png.write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
+        b"\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx"
+        b"\x9cc\xf8\x0f\x00\x00\x01\x01\x00\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+    index = tmp_path / "stickers.toml"
+    index.write_text(
+        '[[sticker]]\nid = "confused"\nfile = "confused.png"\n',
+        encoding="utf-8",
+    )
+    catalog = StickerCatalog(index, stickers_dir)
+    sticker = Attachment(
+        url="https://example.com/download?fileid=DOG",
+        filename="confused.gif",
+        content_type="image/gif",
+        size=12,
+    )
+    vision = MagicMock()
+    vision.partition = MagicMock(return_value=((sticker,), ()))
+    vision.fetch_images = AsyncMock(return_value=[])
+    vision.resolve_sticker_notes = AsyncMock(
+        return_value=StickerNotes(
+            notes=["问号柴犬（已入库；对方刚发的这张，本轮不要原样发回去）"],
+            inbound_ids=("confused",),
+        )
+    )
+    llm = MagicMock()
+    llm.complete = AsyncMock(return_value="[[sticker:confused]]")
+    bot = _bot(vision=vision, llm=llm, stickers=catalog)
+    message = _group_message(text="", attachments=(sticker,))
+    asyncio.run(bot._handle_turn(message))
+    bot._test_replies.send_segments.assert_not_awaited()  # type: ignore[attr-defined]
+    bot._test_memory.append.assert_any_call(  # type: ignore[attr-defined]
+        message.session_id,
+        "user",
+        "[群友] 未知(user-a)\n[表情包] 问号柴犬（已入库；对方刚发的这张，本轮不要原样发回去）",
+    )
