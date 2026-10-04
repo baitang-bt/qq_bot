@@ -109,6 +109,17 @@ class StickerLibrary:
             return truncate_description(str(row.get("description") or ""))
         return ""
 
+    def id_for_md5(self, digest: str) -> str:
+        """Return the toml sticker id for this content hash, or empty."""
+        digest = (digest or "").strip().lower()
+        if not digest:
+            return ""
+        for row in self._load_rows():
+            if str(row.get("md5") or "").strip().lower() != digest:
+                continue
+            return str(row.get("id") or "").strip().lower()
+        return ""
+
     def save_sticker(
         self,
         data: bytes,

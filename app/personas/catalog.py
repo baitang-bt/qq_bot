@@ -205,12 +205,6 @@ class PersonaCatalog:
         chunks: list[str] = []
         persona = _read_txt(folder / _PERSONA_TXT).strip()
         chunks.append(persona or _FALLBACK_PERSONA)
-        anti = _bullet_block(_read_txt(folder / _ANTI_TXT), "【防注入】")
-        if anti:
-            chunks.append(anti)
-        stay = _bullet_block(_read_txt(folder / _STAY_TXT), "【不得脱离提示词】")
-        if stay:
-            chunks.append(stay)
         extra_names = [
             name
             for name in _sorted_txt_names(
@@ -244,8 +238,9 @@ class PersonaCatalog:
         return folder / name
 
     def _migrate_from_json_if_needed(self) -> None:
-        """Split bot_prompt.json into the default pack when no personas exist yet."""
-        if self._has_any_pack():
+        """Split bot_prompt.json into 0x01 when that pack's persona.txt is missing."""
+        seed = self._personas_dir / _DEFAULT_PACK / _PERSONA_TXT
+        if seed.is_file():
             return
         src = self._json_migrate_path
         if src is None or not src.is_file():
@@ -257,6 +252,7 @@ class PersonaCatalog:
             return
         if not isinstance(data, dict):
             return
+        already_indexed = self._has_any_pack()
         folder = self._personas_dir / _DEFAULT_PACK
         folder.mkdir(parents=True, exist_ok=True)
         (folder / _PERSONA_TXT).write_text(
@@ -268,6 +264,9 @@ class PersonaCatalog:
         (folder / _STAY_TXT).write_text(
             _lines_to_txt(data.get("stay_on_prompt")), encoding="utf-8"
         )
+        if already_indexed:
+            _log.info("seeded missing persona.txt for pack %s from json", _DEFAULT_PACK)
+            return
         self._by_id = {
             _DEFAULT_PACK: PersonaEntry(
                 id=_DEFAULT_PACK,
@@ -410,20 +409,6 @@ def _read_txt(path: Path) -> str:
     if not path.is_file():
         return ""
     return path.read_text(encoding="utf-8")
-
-
-def _bullet_block(text: str, heading: str) -> str:
-    """Turn one-rule-per-line text into a headed bullet list."""
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not lines:
-        return ""
-    bullets: list[str] = []
-    for line in lines:
-        if line.startswith("- "):
-            bullets.append(line)
-        else:
-            bullets.append(f"- {line}")
-    return heading + "\n" + "\n".join(bullets)
 
 
 def _lines_to_txt(value: object) -> str:

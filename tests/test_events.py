@@ -383,6 +383,9 @@ def test_parse_quote_image_only_placeholder() -> None:
     assert message is not None
     assert message.quoted_text == "[引用图片]"
     assert "[引用]" in message.user_text
+    assert len(message.quoted_image_attachments) == 1
+    assert message.quoted_image_attachments[0].url.endswith("sticker.png")
+    assert message.image_attachments == ()
 
 
 def test_parse_quote_unresolved_empty() -> None:

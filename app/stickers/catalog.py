@@ -67,6 +67,11 @@ class StickerCatalog:
             return ""
         return self.description_for_id(sticker_id)
 
+    def id_for_md5(self, digest: str) -> str:
+        """Return the catalog sticker id for a content md5, or empty."""
+        self._reload_if_changed()
+        return self._by_md5.get((digest or "").strip().lower(), "")
+
     def description_for_id(self, sticker_id: str) -> str:
         """Return the cached description for a sticker id, or empty."""
         self._reload_if_changed()
@@ -107,7 +112,9 @@ class StickerCatalog:
         if not lines:
             return ""
         return (
-            "【可用本地表情（偶尔用，每轮最多 2 个；按描述选 id；含学来的与文件夹里的文件；禁止编造未列出的 id）】\n"
+            "【可用本地表情】入站/引用的表情由程序自动评估入库，你不用写磁盘，也不要说「没有往表情库写文件的能力」。"
+            "用户让你存或发出去时：若本轮 [表情包] 注里已有 [[sticker:id]]，或下面列表能对上画面，直接插入该标记（每轮最多 2 个）；"
+            "禁止编造未列出的 id，不要把标记解释给用户看。\n"
             + "\n".join(lines)
         )
 
@@ -171,6 +178,11 @@ class StickerCatalog:
                 if isinstance(tags_raw, list) and str(item).strip()
             )
             digest = str(row.get("md5") or "").strip().lower()
+            if not digest:
+                try:
+                    digest = content_md5(path.read_bytes())
+                except OSError:
+                    digest = ""
             description = truncate_description(str(row.get("description") or ""))
             source = str(row.get("source") or "").strip()
             by_id[sticker_id] = StickerEntry(

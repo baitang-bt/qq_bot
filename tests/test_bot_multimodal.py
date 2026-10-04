@@ -136,6 +136,8 @@ def test_handle_turn_sticker_uses_notes_not_images(caplog, tmp_path: Path) -> No
         asyncio.run(bot._handle_turn(message))
 
     vision.resolve_sticker_notes.assert_awaited_once()
+    call_kwargs = vision.resolve_sticker_notes.await_args.kwargs
+    assert call_kwargs.get("force_save") is False
     kwargs = llm.complete.await_args.kwargs
     assert kwargs["images"] == []
     assert kwargs["notes"] == ["一只猫在捂脸"]
@@ -180,3 +182,39 @@ def test_handle_turn_outbound_sticker_marker(tmp_path: Path) -> None:
     bot._test_memory.append.assert_any_call(  # type: ignore[attr-defined]
         message.session_id, "assistant", "无奈\n[发送表情:facepalm]"
     )
+
+
+def test_handle_turn_quoted_sticker_asks_to_save(tmp_path: Path) -> None:
+    """Quoted images are triaged as stickers and force-saved when the user asks."""
+    quoted = Attachment(
+        url="https://example.com/download?fileid=FISH",
+        filename="fish.gif",
+        content_type="image/gif",
+        size=12,
+    )
+    vision = MagicMock()
+    vision.partition = MagicMock(
+        side_effect=[((), ()), ((quoted,), ())],
+    )
+    vision.fetch_images = AsyncMock(return_value=[])
+    vision.resolve_sticker_notes = AsyncMock(
+        return_value=["耳机金鱼 → 可发 [[sticker:goldfish_phones]]"]
+    )
+    llm = MagicMock()
+    llm.complete = AsyncMock(return_value="好 [[sticker:goldfish_phones]]")
+    bot = _bot(vision=vision, llm=llm)
+    message = IncomingMessage(
+        event_type=GROUP_AT_EVENT,
+        event_id="e1",
+        msg_id="m1",
+        content="@0x01 能存一下然后把这个表情发出来吗",
+        user_openid="user-a",
+        group_openid="group-b",
+        quoted_text="[引用图片]",
+        quoted_attachments=(quoted,),
+    )
+    asyncio.run(bot._handle_turn(message))
+    vision.resolve_sticker_notes.assert_awaited_once()
+    args, kwargs = vision.resolve_sticker_notes.await_args
+    assert args[0] == (quoted,)
+    assert kwargs["force_save"] is True

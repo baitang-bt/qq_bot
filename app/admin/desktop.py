@@ -201,12 +201,9 @@ class AdminWindow(QMainWindow):
         file_row = QHBoxLayout(files)
         self._btn_stickers = QPushButton("打开表情包")
         self._btn_stickers.setToolTip("访达打开 data/stickers（PNG/JPG/GIF）")
-        self._btn_personas_folder = QPushButton("打开人设")
-        self._btn_personas_folder.setToolTip("访达打开 data/personas（每套人设一个文件夹）")
         self._btn_project_folder = QPushButton("打开项目根")
         self._btn_project_folder.setToolTip("访达打开仓库根目录（personas.toml、.env、reply_policy.toml）")
         file_row.addWidget(self._btn_stickers)
-        file_row.addWidget(self._btn_personas_folder)
         file_row.addWidget(self._btn_project_folder)
         layout.addWidget(files)
         layout.addStretch(1)
@@ -283,7 +280,7 @@ class AdminWindow(QMainWindow):
 
         left = QWidget()
         left_layout = QVBoxLayout(left)
-        hint = QLabel("点选只用来编辑。线上口吻以「启用」的那一套为准，下一条消息生效。")
+        hint = QLabel("点选只用来编辑。右侧「选择」启用线上口吻，下一条消息生效。")
         hint.setWordWrap(True)
         hint.setProperty("role", "muted")
         left_layout.addWidget(hint)
@@ -293,9 +290,12 @@ class AdminWindow(QMainWindow):
         self._btn_new_persona = QPushButton("新建")
         self._btn_enable_persona = QPushButton("启用")
         self._btn_delete_persona = QPushButton("删除")
+        self._btn_personas_folder = QPushButton("打开人设")
+        self._btn_personas_folder.setToolTip("访达打开 data/personas（每套人设一个文件夹）")
         pack_actions.addWidget(self._btn_new_persona)
         pack_actions.addWidget(self._btn_enable_persona)
         pack_actions.addWidget(self._btn_delete_persona)
+        pack_actions.addWidget(self._btn_personas_folder)
         left_layout.addLayout(pack_actions)
         split.addWidget(left)
 
@@ -328,8 +328,12 @@ class AdminWindow(QMainWindow):
         root = QWidget()
         layout = QVBoxLayout(root)
         layout.addWidget(QLabel("reply_policy.toml"))
+        hint = QLabel("含回复开关、频率、未@规则，以及防注入 / 不得脱离提示词。保存后下一条消息生效。")
+        hint.setWordWrap(True)
+        hint.setProperty("role", "muted")
+        layout.addWidget(hint)
         self._policy = QPlainTextEdit()
-        self._policy.setPlaceholderText("回复开关、频率、未@策略…")
+        self._policy.setPlaceholderText("回复开关、频率、防注入…")
         layout.addWidget(self._policy, stretch=1)
         self._btn_save_policy = QPushButton("保存策略")
         layout.addWidget(self._btn_save_policy)
@@ -656,15 +660,18 @@ class AdminWindow(QMainWindow):
         for pack in packs:
             pack_id = str(pack.get("id") or "")
             title = str(pack.get("title") or pack_id)
-            suffix = " · 启用" if pack.get("active") else ""
-            item = QListWidgetItem(f"{title}{suffix}\n{pack_id}")
+            is_active = bool(pack.get("active"))
+            item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, pack_id)
+            row = self._persona_row_widget(pack_id, title, is_active)
+            item.setSizeHint(row.sizeHint())
             self._persona_list.addItem(item)
-            if pack.get("active"):
+            self._persona_list.setItemWidget(item, row)
+            if is_active:
                 active = pack_id
             if keep_id and pack_id == keep_id:
                 selected = item
-            elif selected is None and pack.get("active"):
+            elif selected is None and is_active:
                 selected = item
         if selected is None and self._persona_list.count():
             selected = self._persona_list.item(0)
@@ -678,6 +685,51 @@ class AdminWindow(QMainWindow):
             self._persona_editor.setPlainText("")
         if not keep_id and active:
             self._persona_id = active
+
+    def _persona_row_widget(
+        self, pack_id: str, title: str, is_active: bool
+    ) -> QWidget:
+        """Build one list row: title/id on the left, 选择 button on the right."""
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(8)
+        suffix = " · 启用" if is_active else ""
+        label = QLabel(f"{title}{suffix}\n{pack_id}")
+        label.setWordWrap(False)
+        layout.addWidget(label, stretch=1)
+        btn = QPushButton("选择")
+        btn.setFixedWidth(56)
+        btn.setToolTip("启用这套人设作为线上口吻")
+        btn.setEnabled(not is_active)
+        if is_active:
+            btn.setText("已用")
+            btn.setToolTip("当前线上口吻就是这套")
+        btn.clicked.connect(lambda _checked=False, pid=pack_id: self._select_persona(pid))
+        layout.addWidget(btn)
+        row.setMinimumHeight(48)
+        return row
+
+    def _select_persona(self, pack_id: str) -> None:
+        """Select a pack in the list and enable it as the bot's active persona."""
+        pack_id = (pack_id or "").strip()
+        if not pack_id:
+            return
+        for index in range(self._persona_list.count()):
+            item = self._persona_list.item(index)
+            if item is None:
+                continue
+            if str(item.data(Qt.ItemDataRole.UserRole) or "") == pack_id:
+                self._persona_list.setCurrentItem(item)
+                break
+        self._persona_id = pack_id
+        self._flush_persona_editor()
+        try:
+            store.set_persona_active(pack_id)
+        except (OSError, ValueError) as exc:
+            self._alert("无法启用", str(exc) or store.format_error(exc), QMessageBox.Icon.Warning)
+            return
+        self.load_personas()
 
     def on_persona_selected(
         self, current: QListWidgetItem | None, _previous: QListWidgetItem | None
@@ -776,15 +828,9 @@ class AdminWindow(QMainWindow):
         """Make the selected pack the one the bot uses."""
         pack_id = self._persona_id
         if not pack_id:
-            self._alert("未选中人设", "先在左侧选一套再启用。", QMessageBox.Icon.Warning)
+            self._alert("未选中人设", "先在左侧选一套再点「选择」或「启用」。", QMessageBox.Icon.Warning)
             return
-        self._flush_persona_editor()
-        try:
-            store.set_persona_active(pack_id)
-        except (OSError, ValueError) as exc:
-            self._alert("无法启用", str(exc) or store.format_error(exc), QMessageBox.Icon.Warning)
-            return
-        self.load_personas()
+        self._select_persona(pack_id)
 
     def on_delete_persona(self) -> None:
         """Delete the selected pack if it is not active and not the last one."""

@@ -49,6 +49,8 @@ class ReplySettings:
     unmentioned_thread_minutes: float = 30.0
     unmentioned_off_peak_only: bool = True
     speak_mode: str = SPEAK_AUTO
+    anti_injection: tuple[str, ...] = ()
+    stay_on_prompt: tuple[str, ...] = ()
 
 
 def default_settings() -> ReplySettings:
@@ -95,6 +97,8 @@ def load_reply_settings(path: Path) -> ReplySettings:
             data.get("unmentioned_off_peak_only", base.unmentioned_off_peak_only)
         ),
         speak_mode=normalize_speak_mode(data.get("speak_mode", base.speak_mode)),
+        anti_injection=_string_tuple(data.get("anti_injection")),
+        stay_on_prompt=_string_tuple(data.get("stay_on_prompt")),
     )
 
 
@@ -131,6 +135,35 @@ def upsert_speak_mode_text(text: str, mode: str) -> str:
         "\n\n# 群发言模式：auto=自动 / all=全部尝试回复 / mention_quote=仅@和引用\n"
         f"{line}\n"
     )
+
+
+def prompt_guard_chunks(
+    anti_injection: tuple[str, ...],
+    stay_on_prompt: tuple[str, ...],
+) -> list[str]:
+    """Format reply-policy safety lists as headed system-prompt sections."""
+    chunks: list[str] = []
+    anti = _bullet_lines(anti_injection)
+    if anti:
+        chunks.append("【防注入】\n" + anti)
+    stay = _bullet_lines(stay_on_prompt)
+    if stay:
+        chunks.append("【不得脱离提示词】\n" + stay)
+    return chunks
+
+
+def _bullet_lines(items: tuple[str, ...]) -> str:
+    """Join non-empty lines as markdown bullets."""
+    bullets: list[str] = []
+    for item in items:
+        line = item.strip()
+        if not line:
+            continue
+        if line.startswith("- "):
+            bullets.append(line)
+        else:
+            bullets.append(f"- {line}")
+    return "\n".join(bullets)
 
 
 def _string_tuple(value: object) -> tuple[str, ...]:

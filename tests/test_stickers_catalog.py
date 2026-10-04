@@ -5,6 +5,7 @@ from pathlib import Path
 from PIL import Image
 
 from app.stickers.catalog import StickerCatalog
+from app.stickers.library import content_md5
 from app.stickers.markers import StickerSeg, TextSeg, parse_reply_segments
 
 
@@ -34,6 +35,8 @@ def test_catalog_loads_existing_file(tmp_path: Path) -> None:
     assert catalog.path_for("facepalm") == (stickers / "facepalm.png").resolve()
     assert catalog.known_ids() == ["facepalm"]
     assert catalog.description_for_id("facepalm") == "一只猫捂脸"
+    digest = content_md5((stickers / "facepalm.png").read_bytes())
+    assert catalog.id_for_md5(digest) == "facepalm"
     block = catalog.prompt_block()
     assert "[[sticker:facepalm]]" in block
     assert "一只猫捂脸" in block

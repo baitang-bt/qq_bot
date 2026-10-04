@@ -151,7 +151,7 @@ def test_library_description_hit_skips_triage(tmp_path: Path) -> None:
     with patch.object(vision, "_download", side_effect=fake_download):
         notes = asyncio.run(vision.resolve_sticker_notes((sticker,)))
 
-    assert notes == ["本地描述缓存"]
+    assert notes == ["本地描述缓存 → 可发 [[sticker:facepalm_cat]]"]
     triage.assert_not_awaited()
     assert cache.get([f"md5:{hashlib.md5(data).hexdigest()}"]) == "本地描述缓存"
 
@@ -239,7 +239,7 @@ def test_triage_save_true_learns_and_dual_writes(tmp_path: Path) -> None:
     with patch.object(vision, "_download", side_effect=fake_download):
         notes = asyncio.run(vision.resolve_sticker_notes((sticker,)))
 
-    assert notes == ["通用捂脸猫"]
+    assert notes == ["通用捂脸猫 → 可发 [[sticker:facepalm_cat]]"]
     assert library.learned_count() == 1
     digest = content_md5(data)
     assert cache.get([f"md5:{digest}"]) == "通用捂脸猫"
@@ -361,7 +361,7 @@ def test_learn_animated_gif_writes_gif_file(tmp_path: Path) -> None:
     with patch.object(vision, "_download", side_effect=fake_download):
         notes = asyncio.run(vision.resolve_sticker_notes((sticker,)))
 
-    assert notes == ["跳舞小人"]
+    assert notes == ["跳舞小人 → 可发 [[sticker:dance_loop]]"]
     payload, mime = triage.await_args.args
     assert mime == "image/png"
     assert payload.startswith(b"\x89PNG")
@@ -369,6 +369,49 @@ def test_learn_animated_gif_writes_gif_file(tmp_path: Path) -> None:
     assert dest.is_file()
     assert dest.read_bytes().startswith(b"GIF8")
     assert dest.read_bytes() == gif
+
+
+def test_force_save_learns_when_triage_would_skip(tmp_path: Path) -> None:
+    """User asking to keep a sticker writes the file even if triage.save is false."""
+    data = _png_bytes((7, 8, 9))
+    stickers = tmp_path / "stickers"
+    index = tmp_path / "stickers.toml"
+    library = StickerLibrary(stickers, index)
+    catalog = StickerCatalog(index, stickers)
+    triage = AsyncMock(
+        return_value=StickerTriage(
+            description="耳机金鱼",
+            save=False,
+            sticker_id="goldfish_phones",
+            reason="once",
+        )
+    )
+    vision = ImageIdentifier(
+        _settings(tmp_path),
+        ImageCache(tmp_path / "bot.sqlite3"),
+        triage=triage,
+        library=library,
+        catalog=catalog,
+        auto_learn=True,
+    )
+    sticker = Attachment(
+        url="https://x.example/download?fileid=FISH",
+        filename="fish.gif",
+        content_type="image/gif",
+        size=1,
+    )
+
+    async def fake_download(_attachment):
+        return data, "image/png"
+
+    with patch.object(vision, "_download", side_effect=fake_download):
+        notes = asyncio.run(
+            vision.resolve_sticker_notes((sticker,), force_save=True)
+        )
+
+    assert library.learned_count() == 1
+    assert notes == ["耳机金鱼 → 可发 [[sticker:goldfish_phones]]"]
+    assert (stickers / "goldfish_phones.png").is_file()
 
 
 def test_learn_jpeg_keeps_jpeg(tmp_path: Path) -> None:

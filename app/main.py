@@ -17,6 +17,8 @@ from app.impression.store import ImpressionStore
 from app.impression.writer import ImpressionWriter
 from app.llm.client import LLMClient
 from app.memory.store import MemoryStore
+from app.personas.catalog import PersonaCatalog
+from app.prompt_book import PromptBook
 from app.qq.dedupe import MessageDedupe
 from app.qq.gateway import QQGateway
 from app.qq.gateway_stats import MONITOR
@@ -48,7 +50,19 @@ def create_app() -> FastAPI:
         settings.stickers_index_path,
         max_learned=settings.sticker_learn_max,
     )
-    llm = LLMClient(settings, stickers_prompt=stickers.prompt_block())
+    gate = ReplyGate(settings.reply_policy_path)
+    llm = LLMClient(
+        settings,
+        prompts=PromptBook(
+            PersonaCatalog(
+                settings.personas_index_path,
+                settings.personas_dir,
+                json_migrate_path=settings.bot_prompt_path,
+            ),
+            gate=gate,
+        ),
+        stickers_prompt=stickers.prompt_block(),
+    )
     db_path = settings.data_dir / "bot.sqlite3"
     memory = MemoryStore(db_path, max_turns=settings.memory_max_turns)
 
@@ -67,7 +81,6 @@ def create_app() -> FastAPI:
         auto_learn=settings.sticker_auto_learn,
         on_learned=_refresh_stickers_prompt,
     )
-    gate = ReplyGate(settings.reply_policy_path)
     impressions = ImpressionStore(settings.data_dir / "impressions")
     writer = ImpressionWriter(llm, impressions)
     commands = CommandRouter(OwnerGate(settings.qq_id, settings.data_dir), impressions)

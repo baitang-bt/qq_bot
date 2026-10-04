@@ -113,19 +113,26 @@ class ImageIdentifier:
     async def resolve_sticker_notes(
         self,
         attachments: tuple[Attachment, ...],
+        *,
+        force_save: bool = False,
     ) -> list[str]:
         """Return sticker descriptions: cache/library hit skips vision; miss triages."""
         notes: list[str] = []
         for attachment in attachments:
-            note = await self._resolve_one_sticker(attachment)
+            note = await self._resolve_one_sticker(attachment, force_save=force_save)
             if note:
                 notes.append(note)
         return notes
 
-    async def _resolve_one_sticker(self, attachment: Attachment) -> str:
+    async def _resolve_one_sticker(
+        self,
+        attachment: Attachment,
+        *,
+        force_save: bool = False,
+    ) -> str:
         """Resolve one sticker: library/catalog → image_cache → triage → optional learn."""
         keys = keys_from_attachment(attachment)
-        if self._cache is not None and keys:
+        if not force_save and self._cache is not None and keys:
             cached = self._cache.get(keys)
             if cached:
                 _log.info("sticker cache hit keys=%s", keys[:2])
@@ -151,20 +158,30 @@ class ImageIdentifier:
                 digest[:10],
                 len(local_desc),
             )
-            return local_desc
+            return self._note_with_marker(digest, local_desc)
 
         all_keys = self._merge_keys(keys, data)
+        cached = ""
         if self._cache is not None:
-            cached = self._cache.get(all_keys)
-            if cached:
-                _log.info("sticker cache hit after download keys=%s", all_keys[:2])
-                self._cache.put(all_keys, cached, source="backfill")
-                return cached
+            cached = (self._cache.get(all_keys) or "").strip()
+        already_saved = self._already_saved(digest)
+        if cached and not (force_save and not already_saved):
+            _log.info("sticker cache hit after download keys=%s", all_keys[:2])
+            self._cache.put(all_keys, cached, source="backfill")
+            return self._note_with_marker(digest, cached)
 
-        triage = await self._run_triage(*frame_for_model(data))
-        desc = (triage.description or "").strip()
-        if not desc or desc in _BAD_CACHE_DESCRIPTIONS:
-            return desc or _MISS_NOTE
+        if cached and force_save:
+            triage = StickerTriage(
+                description=cached,
+                save=True,
+                reason="user_requested",
+            )
+            desc = cached
+        else:
+            triage = await self._run_triage(*frame_for_model(data))
+            desc = (triage.description or "").strip()
+            if not desc or desc in _BAD_CACHE_DESCRIPTIONS:
+                return desc or _MISS_NOTE
 
         if self._cache is not None and all_keys:
             self._cache.put(all_keys, desc, source="vision")
@@ -172,13 +189,32 @@ class ImageIdentifier:
 
         if (
             self._auto_learn
-            and triage.save
+            and (triage.save or force_save)
             and self._library is not None
             and not self._library.has_md5(digest)
         ):
             self._try_learn(data, mime, digest, triage, desc)
 
+        return self._note_with_marker(digest, desc)
+
+    def _note_with_marker(self, digest: str, desc: str) -> str:
+        """Append a sendable [[sticker:id]] when this image is already in the library."""
+        sticker_id = ""
+        if self._catalog is not None:
+            sticker_id = self._catalog.id_for_md5(digest)
+        if not sticker_id and self._library is not None:
+            sticker_id = self._library.id_for_md5(digest)
+        if sticker_id:
+            return f"{desc} → 可发 [[sticker:{sticker_id}]]"
         return desc
+
+    def _already_saved(self, digest: str) -> bool:
+        """True when catalog or library already has this content hash."""
+        if self._catalog is not None and self._catalog.has_md5(digest):
+            return True
+        if self._library is not None and self._library.has_md5(digest):
+            return True
+        return False
 
     def _local_description(self, digest: str) -> str:
         """Return a description from catalog or library for this content md5."""

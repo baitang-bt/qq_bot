@@ -13,7 +13,7 @@ QQ 官方机器人（API v2）闲聊程序，附带 macOS 桌面控制台。电�
 - **引用与分条**：用户引用消息时（`message_type=103`），从 `msg_elements` 或本地 `msg_idx` 缓存取出被引用正文，拼成 `[引用]…[消息]…` 交给模型。机器人自己发出的消息会记住响应里的 `ext_info.ref_idx`，才能识别「引用了我」。平台没有按 id 拉历史消息的接口；进程重启后、未见过的消息且事件没带正文时，引用可能为空。群内要缓存他人消息，需开启「获取群内全部消息」。模型可用单独一行的 `---` 拆成多条短回复。
 - **连发合并**：同一用户短时间内连续发送的文字会合并成一条再回复；图文同条则立即处理。
 - **人设与印象**：多套 txt 人设，同时只启用一套；每位用户一份印象。
-- **回复策略**：开关、频率、关键词、未 @ 规则写在配置里，保存后下一条消息即生效。
+- **回复策略**：开关、频率、关键词、未 @ 规则，以及防注入提示词，保存后下一条消息即生效。
 - **桌面控制台**：启动/停止、看日志、改 API、人设、回复策略、印象和管理员。
 
 ## 使用前准备
@@ -73,10 +73,10 @@ START_NGROK=1 ./scripts/start-local.sh
 | 页 | 做什么 |
 | --- | --- |
 | 运行 | 启动 / 停止、消息监控日志 |
-| Bot 功能 | 群发言模式；打开表情包 / 人设 / 项目根 |
+| Bot 功能 | 群发言模式；打开表情包 / 项目根 |
 | API | 编辑 `.env` 里的 QQ 与模型配置（密钥打码；留空表示不改）。保存后要在「运行」页重启才生效 |
 | 人设 | 多套 txt 人设：左侧选编辑，点「启用」才生效；右侧编单个 txt |
-| 回复策略 | 编辑 `reply_policy.toml` |
+| 回复策略 | 编辑 `reply_policy.toml`（含防注入） |
 | 印象 | 浏览、新建、导入用户印象 |
 | 管理员 | 谁可以使用斜杠指令 |
 
@@ -121,13 +121,13 @@ description = "一只猫捂脸，无奈"
 
 ## 人设
 
-清单在仓库根 `personas.toml`（`active` 指定当前启用的一套），正文在 `data/personas/<id>/*.txt`（与表情包一样不进 git）。每套文件夹可放多个 txt：
+清单在仓库根 `personas.toml`（`active` 指定当前启用的一套），正文在 `data/personas/<id>/*.txt`（与表情包一样不进 git）。仓库里有一套示范：`examples/personas/0x01/`（旧 `bot_prompt.json` 拆成的 txt）。每套文件夹可放多个 txt：
 
 - `persona.txt` — 主口吻
-- `anti_injection.txt` / `stay_on_prompt.txt` — 每行一条，组装进系统提示
+- `anti_injection.txt` / `stay_on_prompt.txt` — 防注入与不得脱离人设（控制台可编；线上守卫以 `reply_policy.toml` 为准）
 - 其它 `.txt` 按文件名排序，以 `【文件名】` 作为块标题
 
-控制台「人设」页：左侧点选只用于编辑，点「启用」才切换线上口吻（下一条消息生效）。首次若还没有文件夹，会把旧的 `bot_prompt.json` 拆进 `data/personas/0x01/`。路径可用 `PERSONAS_DIR`、`PERSONAS_INDEX_PATH` 覆盖。
+控制台「人设」页：左侧点选只用于编辑，点「启用」才切换线上口吻（下一条消息生效）；「打开人设」会在访达打开 `data/personas`。首次若还没有 `0x01/persona.txt`，会把旧的 `bot_prompt.json` 拆进 `data/personas/0x01/`。路径可用 `PERSONAS_DIR`、`PERSONAS_INDEX_PATH` 覆盖。
 
 每位用户的印象在 `data/impressions/<openid>.json`（官方接口不提供 QQ 号，用 openid；对方在聊天里写出 QQ 号时会记到 `qq` 字段）。
 
@@ -143,6 +143,7 @@ description = "一只猫捂脸，无奈"
 - `group_unmentioned`：自动模式下是否处理未 @ 的群消息
 - `bot_names`：话里出现这些名字时，可视为在叫机器人
 - `unmentioned_off_peak_only`：自动模式下为 true 时，工作日白天拦截未 @ 且未引用机器人的群消息
+- `anti_injection` / `stay_on_prompt`：系统提示里的防注入与不得脱离人设，每条一行
 
 ## 测试
 
@@ -161,4 +162,5 @@ pytest
 - `app/personas/` — 多人设 txt 清单
 - `app/impression/` — 用户印象
 - `personas.toml` / `reply_policy.toml` / `stickers.toml` — 人设清单、回复策略、表情清单
+- `examples/personas/0x01/` — 入库的示范人设（旧 JSON 拆成的 txt）
 - `bot_prompt.json` — 仅作首次迁入 `data/personas/` 的来源

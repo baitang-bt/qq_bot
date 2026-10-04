@@ -44,6 +44,7 @@ class IncomingMessage:
     quotes_bot: bool = False
     message_type: int = 0
     attachments: tuple[Attachment, ...] = field(default_factory=tuple)
+    quoted_attachments: tuple[Attachment, ...] = field(default_factory=tuple)
 
     @property
     def is_group(self) -> bool:
@@ -69,15 +70,14 @@ class IncomingMessage:
     @property
     def image_attachments(self) -> tuple[Attachment, ...]:
         """Attachments that look like still images or sticker GIFs."""
-        images: list[Attachment] = []
-        for item in self.attachments:
-            ctype = item.content_type.lower()
-            name = item.filename.lower()
-            if ctype.startswith("image/") or name.endswith(
-                (".png", ".jpg", ".jpeg", ".gif", ".webp")
-            ):
-                images.append(item)
-        return tuple(images)
+        return tuple(item for item in self.attachments if _is_image_attachment(item))
+
+    @property
+    def quoted_image_attachments(self) -> tuple[Attachment, ...]:
+        """Images on the quoted message (type 103), used to learn/send stickers."""
+        return tuple(
+            item for item in self.quoted_attachments if _is_image_attachment(item)
+        )
 
     @property
     def voice_attachments(self) -> tuple[Attachment, ...]:
@@ -240,6 +240,15 @@ def _collect_msg_elements_body(raw: Any) -> tuple[str, tuple[Attachment, ...]]:
     return "\n".join(texts).strip(), tuple(attachments)
 
 
+def _is_image_attachment(item: Attachment) -> bool:
+    """True when an attachment looks like a still image or sticker file."""
+    ctype = item.content_type.lower()
+    name = item.filename.lower()
+    return ctype.startswith("image/") or name.endswith(
+        (".png", ".jpg", ".jpeg", ".gif", ".webp")
+    )
+
+
 def _merge_content_with_elements(content: str, element_text: str) -> str:
     """Combine top-level content with inline msg_elements text without duplication."""
     base = content.strip()
@@ -286,12 +295,15 @@ def parse_incoming(payload: dict[str, Any]) -> IncomingMessage | None:
     message_type = int(data.get("message_type") or 0)
     element_text = ""
     element_attachments: tuple[Attachment, ...] = ()
+    quoted_attachments: tuple[Attachment, ...] = ()
     if message_type in {101, 102}:
         element_text, element_attachments = _collect_msg_elements_body(
             data.get("msg_elements")
         )
         attachments = _merge_attachments(attachments, element_attachments)
-    elif message_type != 103:
+    elif message_type == 103:
+        _, quoted_attachments = _collect_msg_elements_body(data.get("msg_elements"))
+    else:
         element_text, element_attachments = _collect_msg_elements_body(
             data.get("msg_elements")
         )
@@ -338,6 +350,7 @@ def parse_incoming(payload: dict[str, Any]) -> IncomingMessage | None:
         quotes_bot=quoted.quotes_bot,
         message_type=message_type,
         attachments=attachments,
+        quoted_attachments=quoted_attachments,
     )
 
 
@@ -370,6 +383,16 @@ def merge_inbound_messages(messages: list[IncomingMessage]) -> IncomingMessage:
             if key:
                 seen.add(key)
             attachments.append(attachment)
+    quoted_attachments: list[Attachment] = []
+    quoted_seen: set[str] = set()
+    for item in messages:
+        for attachment in item.quoted_attachments:
+            key = attachment.url or attachment.filename or attachment.asr_refer_text
+            if key and key in quoted_seen:
+                continue
+            if key:
+                quoted_seen.add(key)
+            quoted_attachments.append(attachment)
     mentioned = any(item.mentioned for item in messages)
     quotes_bot = any(item.quotes_bot for item in messages)
     event_type = last.event_type
@@ -390,4 +413,5 @@ def merge_inbound_messages(messages: list[IncomingMessage]) -> IncomingMessage:
         quotes_bot=quotes_bot,
         message_type=last.message_type,
         attachments=tuple(attachments),
+        quoted_attachments=tuple(quoted_attachments),
     )

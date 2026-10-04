@@ -148,17 +148,22 @@ class ChatBot:
             return
         user_text = message.user_text
         image_attachments = message.image_attachments
+        quoted_images = message.quoted_image_attachments
         history = self._memory.history(message.session_id)
         quote_inbound = should_quote_inbound(history)
         sticker_notes: list[str] = []
         image_bytes: list[tuple[bytes, str]] = []
-        if image_attachments:
+        if image_attachments or quoted_images:
             stickers, photos = self._vision.partition(image_attachments)
+            if quoted_images:
+                quoted_stickers, quoted_photos = self._vision.partition(quoted_images)
+                stickers = tuple(stickers) + quoted_stickers + quoted_photos
             _log.info(
-                "media start session=%s stickers=%s photos=%s (no QQ status bubble)",
+                "media start session=%s stickers=%s photos=%s quoted_images=%s (no QQ status bubble)",
                 message.session_id,
                 len(stickers),
                 len(photos),
+                len(quoted_images),
             )
             if not message.is_group and (stickers or photos):
                 try:
@@ -166,7 +171,10 @@ class ChatBot:
                 except Exception:
                     _log.warning("c2c typing before media failed", exc_info=True)
             if stickers:
-                sticker_notes = await self._vision.resolve_sticker_notes(stickers)
+                sticker_notes = await self._vision.resolve_sticker_notes(
+                    stickers,
+                    force_save=_user_asks_to_save_sticker(user_text),
+                )
             if photos:
                 image_bytes = await self._vision.fetch_images(photos)
                 _log.info(
@@ -282,3 +290,22 @@ class ChatBot:
             )
         except Exception:
             _log.exception("impression after_turn failed openid=%s", user_openid)
+
+
+_SAVE_STICKER_HINTS = (
+    "存一下",
+    "存下来",
+    "收藏",
+    "收入表情",
+    "学一下这个",
+    "保存这个表情",
+    "把这个表情",
+    "发这个表情",
+    "发出来",
+    "发出去",
+)
+
+
+def _user_asks_to_save_sticker(text: str) -> bool:
+    """True when the user asked to keep/send the current or quoted sticker."""
+    return any(hint in text for hint in _SAVE_STICKER_HINTS)

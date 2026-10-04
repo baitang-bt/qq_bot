@@ -52,7 +52,10 @@ class LLMClient:
                 settings.personas_dir,
                 json_migrate_path=settings.bot_prompt_path,
             )
-            self._prompts = PromptBook(catalog)
+            self._prompts = PromptBook(
+                catalog,
+                policy_path=settings.reply_policy_path,
+            )
         self._stickers_prompt = stickers_prompt
         self._slot = threading.Lock()
 
